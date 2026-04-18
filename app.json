@@ -23,6 +23,12 @@
           "savePhotosPermission": "用于将照片与视频保存到系统相册。",
           "isAccessMediaLocationEnabled": true
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "用于从系统相册选择照片并在应用内预览。"
+        }
       ]
     ],
     "splash": {

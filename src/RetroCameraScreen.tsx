@@ -1,8 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
   Image,
   Linking,
   Modal,
@@ -10,10 +9,8 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  useWindowDimensions,
   View,
   type ViewStyle,
-  type ViewToken,
 } from 'react-native';
 import {
   CameraView,
@@ -23,20 +20,32 @@ import {
 } from 'expo-camera';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImageManipulator from 'expo-image-manipulator';
+import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import { StatusBar } from 'expo-status-bar';
+import { Ionicons } from '@expo/vector-icons';
 
-import { FILTERS, PRESETS, combinedMatrix, type FilmFilter, type RetroPreset } from './colorMatrix';
+import {
+  FILM_MODE_OPTIONS,
+  FILTERS,
+  combinedMatrix,
+  type FilmFilter,
+  type RetroPreset,
+} from './colorMatrix';
 import { FilmProcessor } from './FilmProcessor';
-import { getQuickDisplayUri, resolveAssetDisplayUri } from './galleryAssetUri';
+import { resolveAssetDisplayUri } from './galleryAssetUri';
 import { getMediaLibraryAccessRequestOptions } from './mediaLibraryPermission';
-/** 相册预览一次拉取最近照片数量（新→旧） */
-const GALLERY_PAGE_SIZE = 80;
 
-/** RN 实验属性：与下层相机用 multiply 混合，减轻半透明浅色 normal 叠层的「发白、发糊」 */
-const previewMultiplyLayerBase = {
+/**
+ * 取景叠层与成片差异说明：
+ * - 成片：Skia ColorMatrix（与配置矩阵一致）
+ * - 预览：仅半透明色块 + blend，无法等价矩阵；且预览流与拍照 JPEG 的曝光/HDR/色彩管线可能不同
+ * 使用 soft-light 比 multiply 更少压暗中间调，观感通常更接近矩阵调色（仍非 1:1）。
+ * 若要几乎一致需把相机帧送进 Skia（如 Vision Camera + 帧处理），成本高。
+ */
+const previewTintLayerBase = {
   ...StyleSheet.absoluteFillObject,
-  experimental_mixBlendMode: 'multiply',
+  experimental_mixBlendMode: 'soft-light',
 } as ViewStyle;
 
 const C = {
@@ -53,55 +62,12 @@ const C = {
   line: 'rgba(201,169,98,0.4)',
 };
 
-function GallerySlide({
-  asset,
-  pageWidth,
-  onImageError,
-}: {
-  asset: MediaLibrary.Asset;
-  pageWidth: number;
-  onImageError: () => void;
-}) {
-  const quick = useMemo(() => getQuickDisplayUri(asset), [asset.id, asset.uri]);
-  const [uri, setUri] = useState(quick);
-
-  useEffect(() => {
-    setUri(quick);
-  }, [quick]);
-
-  useEffect(() => {
-    if (quick) return;
-    let cancelled = false;
-    void (async () => {
-      const u = await resolveAssetDisplayUri(asset);
-      if (!cancelled && u) setUri(u);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [asset, quick]);
-
-  if (!uri) {
-    return (
-      <View style={[styles.viewerPage, { width: pageWidth }]}>
-        <ActivityIndicator color={C.gold} style={styles.viewerSlideLoading} />
-      </View>
-    );
-  }
-
-  return (
-    <View style={[styles.viewerPage, { width: pageWidth }]}>
-      <Image
-        source={{ uri }}
-        style={styles.viewerPageImage}
-        resizeMode="contain"
-        onError={onImageError}
-      />
-    </View>
-  );
+function formatRecordingDuration(totalSec: number): string {
+  const s = Math.max(0, Math.floor(totalSec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
 }
-
-type SheetKind = 'camera' | 'filter' | null;
 
 type ExportJob = {
   uri: string;
@@ -159,7 +125,6 @@ function GridGlyph({ active }: { active: boolean }) {
 export function RetroCameraScreen() {
   const camRef = useRef<InstanceType<typeof CameraView> | null>(null);
   const insets = useSafeAreaInsets();
-  const { width: windowWidth } = useWindowDimensions();
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
@@ -167,27 +132,28 @@ export function RetroCameraScreen() {
   const [cameraReady, setCameraReady] = useState(false);
   const [facing, setFacing] = useState<'back' | 'front'>('back');
   const [mode, setMode] = useState<'picture' | 'video'>('picture');
-  const [presetIndex, setPresetIndex] = useState(0);
   const [filterIndex, setFilterIndex] = useState(0);
-  const [sheet, setSheet] = useState<SheetKind>(null);
+  const [filmModeIndex, setFilmModeIndex] = useState(0);
+  const [filterSheetOpen, setFilterSheetOpen] = useState(false);
+  const [filmSheetOpen, setFilmSheetOpen] = useState(false);
   const [flashMode, setFlashMode] = useState<FlashMode>('off');
   const [showGrid, setShowGrid] = useState(false);
   const [galleryUri, setGalleryUri] = useState<string | null>(null);
-  const [galleryViewerAssets, setGalleryViewerAssets] = useState<MediaLibrary.Asset[] | null>(
-    null,
-  );
-  const [galleryViewerIndex, setGalleryViewerIndex] = useState(0);
+  /** 系统相册选择后，应用内全屏预览用的本地 URI */
+  const [pickedGalleryPreviewUri, setPickedGalleryPreviewUri] = useState<string | null>(null);
 
   const [activeExportJob, setActiveExportJob] = useState<ExportJob | null>(null);
   const exportQueueRef = useRef<ExportJob[]>([]);
   const exportProcessingRef = useRef(false);
 
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingElapsedSec, setRecordingElapsedSec] = useState(0);
+  const recordingStartedAtRef = useRef<number | null>(null);
   const recordingPromiseRef = useRef<Promise<{ uri: string } | undefined> | null>(
     null,
   );
 
-  const preset = PRESETS[presetIndex];
+  const preset = FILM_MODE_OPTIONS[filmModeIndex];
   const filter = FILTERS[filterIndex];
 
   const filterSwatch = (f: FilmFilter): [string, string] =>
@@ -236,64 +202,69 @@ export function RetroCameraScreen() {
     void refreshGalleryThumb();
   }, [refreshGalleryThumb]);
 
+  useEffect(() => {
+    if (!isRecording) {
+      setRecordingElapsedSec(0);
+      recordingStartedAtRef.current = null;
+      return;
+    }
+    recordingStartedAtRef.current = Date.now();
+    setRecordingElapsedSec(0);
+    const id = setInterval(() => {
+      const t0 = recordingStartedAtRef.current;
+      if (t0 == null) return;
+      setRecordingElapsedSec(Math.floor((Date.now() - t0) / 1000));
+    }, 500);
+    return () => clearInterval(id);
+  }, [isRecording]);
+
   const cycleFlash = useCallback(() => {
     setFlashMode((f) => (f === 'off' ? 'on' : 'off'));
   }, []);
 
-  const onGalleryViewableRef = useRef((info: { viewableItems: ViewToken[] }) => {
-    const idx = info.viewableItems[0]?.index;
-    if (typeof idx === 'number') setGalleryViewerIndex(idx);
-  });
-
-  const viewabilityConfigGallery = useRef({
-    itemVisiblePercentThreshold: 55,
-  }).current;
-
-  const closeGalleryViewer = useCallback(() => {
-    setGalleryViewerAssets(null);
-    setGalleryViewerIndex(0);
+  const closePickedGalleryPreview = useCallback(() => {
+    setPickedGalleryPreviewUri(null);
   }, []);
 
-  const onGallerySlideImageError = useCallback(() => {
+  const onPickedGalleryImageError = useCallback(() => {
     Alert.alert(
       '无法显示照片',
       '可尝试在系统设置中授予完整相册访问权限，或使用开发版 (dev build) 测试。',
       [
-        { text: '关闭', style: 'cancel', onPress: closeGalleryViewer },
+        { text: '关闭', style: 'cancel', onPress: closePickedGalleryPreview },
         { text: '去设置', onPress: () => void Linking.openSettings() },
       ],
     );
-  }, [closeGalleryViewer]);
+  }, [closePickedGalleryPreview]);
 
+  /**
+   * 使用系统相册选择器（expo-image-picker），避免 Expo Go 下 MediaLibrary.getAssetsAsync
+   * 批量枚举相册带来的数秒延迟。
+   */
   const openGallery = useCallback(async () => {
-    const ok = await ensureMediaPermission();
-    if (!ok) {
-      Alert.alert('相册权限', '需要允许访问相册中的照片才能预览。', [
-        { text: '取消', style: 'cancel' },
-        { text: '去设置', onPress: () => void Linking.openSettings() },
-      ]);
-      return;
-    }
     try {
-      const page = await MediaLibrary.getAssetsAsync({
-        first: GALLERY_PAGE_SIZE,
-        mediaType: MediaLibrary.MediaType.photo,
-        sortBy: MediaLibrary.SortBy.creationTime,
-      });
-      if (page.assets.length === 0) {
-        Alert.alert('相册', '还没有照片，先拍一张吧。');
+      let libPerm = await ImagePicker.getMediaLibraryPermissionsAsync(false);
+      if (!libPerm.granted) {
+        libPerm = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
+      }
+      if (!libPerm.granted) {
+        Alert.alert('相册权限', '需要允许访问相册中的照片才能预览。', [
+          { text: '取消', style: 'cancel' },
+          { text: '去设置', onPress: () => void Linking.openSettings() },
+        ]);
         return;
       }
-      setGalleryViewerIndex(0);
-      setGalleryViewerAssets(page.assets);
-      const first = page.assets[0];
-      const thumb = getQuickDisplayUri(first);
-      if (thumb) {
-        setGalleryUri(thumb);
-      } else {
-        void resolveAssetDisplayUri(first).then((u) => {
-          if (u) setGalleryUri(u);
-        });
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: false,
+        quality: 1,
+        selectionLimit: 1,
+      });
+      if (result.canceled) return;
+      const uri = result.assets[0]?.uri;
+      if (uri) {
+        setPickedGalleryPreviewUri(uri);
+        setGalleryUri(uri);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -302,7 +273,7 @@ export function RetroCameraScreen() {
         { text: '去设置', onPress: () => void Linking.openSettings() },
       ]);
     }
-  }, [ensureMediaPermission]);
+  }, []);
 
   const advanceExportQueue = useCallback(() => {
     const next = exportQueueRef.current.shift();
@@ -326,13 +297,14 @@ export function RetroCameraScreen() {
   const onFilmExported = useCallback(
     async (processedUri: string) => {
       try {
-        await saveUriToLibrary(processedUri);
-        await refreshGalleryThumb();
+        const ok = await saveUriToLibrary(processedUri);
+        // 写入相册后立刻用成片文件更新缩略图。若马上 getAssetsAsync，索引常未更新仍会拿到上一张。
+        if (ok) setGalleryUri(processedUri);
       } finally {
         advanceExportQueue();
       }
     },
-    [advanceExportQueue, refreshGalleryThumb, saveUriToLibrary],
+    [advanceExportQueue, saveUriToLibrary],
   );
 
   const onFilmError = useCallback(
@@ -340,6 +312,7 @@ export function RetroCameraScreen() {
       try {
         const ok = await saveUriToLibrary(fallbackUri);
         if (ok) {
+          setGalleryUri(fallbackUri);
           Alert.alert(
             '已保存（原图）',
             '胶片矩阵处理失败，已保存未调色原图。详情：' + e.message,
@@ -415,7 +388,7 @@ export function RetroCameraScreen() {
           const ok = await saveUriToLibrary(res.uri);
           if (ok) {
             Alert.alert('已保存', '视频已保存到相册。');
-            await refreshGalleryThumb();
+            setGalleryUri(res.uri);
           }
         }
       } catch (e) {
@@ -444,6 +417,7 @@ export function RetroCameraScreen() {
       recordingPromiseRef.current = p;
       setIsRecording(true);
     } catch (e) {
+      setIsRecording(false);
       Alert.alert('无法开始录像', e instanceof Error ? e.message : String(e));
     }
   }, [
@@ -453,7 +427,6 @@ export function RetroCameraScreen() {
     micPermission?.granted,
     requestCameraPermission,
     requestMicPermission,
-    refreshGalleryThumb,
     saveUriToLibrary,
   ]);
 
@@ -462,14 +435,14 @@ export function RetroCameraScreen() {
     else void toggleRecord();
   }, [mode, takePhoto, toggleRecord]);
 
-  const selectPreset = useCallback((i: number) => {
-    setPresetIndex(i);
-    setSheet(null);
-  }, []);
-
   const selectFilter = useCallback((i: number) => {
     setFilterIndex(i);
-    setSheet(null);
+    setFilterSheetOpen(false);
+  }, []);
+
+  const selectFilmMode = useCallback((i: number) => {
+    setFilmModeIndex(i);
+    setFilmSheetOpen(false);
   }, []);
 
   const permBanner =
@@ -482,38 +455,46 @@ export function RetroCameraScreen() {
       </View>
     ) : null;
 
-  const renderSheet = (kind: 'camera' | 'filter') => (
+  const renderFilmSheet = () => (
     <>
-      <Text style={styles.sheetSectionTitle}>{kind === 'camera' ? '相机' : '滤镜'}</Text>
-      <Text style={styles.sheetHint}>
-        {kind === 'camera'
-          ? '选择相机风格（预览叠色示意；成片为完整矩阵）'
-          : '选择滤镜（预览叠色示意；成片为完整矩阵）'}
-      </Text>
+      <Text style={styles.sheetSectionTitle}>胶片</Text>
+      <Text style={styles.sheetHint}>选择胶片模式（原相机无叠色；其它为预览示意，成片为矩阵处理）</Text>
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.sheetScroll}
       >
-        {kind === 'camera'
-          ? PRESETS.map((p: RetroPreset, i: number) => (
-              <SwatchTile
-                key={p.id}
-                colors={p.swatch}
-                label={p.label}
-                selected={i === presetIndex}
-                onPress={() => selectPreset(i)}
-              />
-            ))
-          : FILTERS.map((f: FilmFilter, i: number) => (
-              <SwatchTile
-                key={f.id}
-                colors={filterSwatch(f)}
-                label={f.label}
-                selected={i === filterIndex}
-                onPress={() => selectFilter(i)}
-              />
-            ))}
+        {FILM_MODE_OPTIONS.map((p: RetroPreset, i: number) => (
+          <SwatchTile
+            key={p.id}
+            colors={p.swatch}
+            label={p.label}
+            selected={i === filmModeIndex}
+            onPress={() => selectFilmMode(i)}
+          />
+        ))}
+      </ScrollView>
+    </>
+  );
+
+  const renderFilterSheet = () => (
+    <>
+      <Text style={styles.sheetSectionTitle}>滤镜</Text>
+      <Text style={styles.sheetHint}>选择滤镜（预览叠色示意；成片为完整矩阵）</Text>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.sheetScroll}
+      >
+        {FILTERS.map((f: FilmFilter, i: number) => (
+          <SwatchTile
+            key={f.id}
+            colors={filterSwatch(f)}
+            label={f.label}
+            selected={i === filterIndex}
+            onPress={() => selectFilter(i)}
+          />
+        ))}
       </ScrollView>
     </>
   );
@@ -539,71 +520,71 @@ export function RetroCameraScreen() {
       ) : null}
 
       <Modal
-        visible={sheet !== null}
+        visible={filmSheetOpen}
         animationType="slide"
         transparent
-        onRequestClose={() => setSheet(null)}
+        onRequestClose={() => setFilmSheetOpen(false)}
       >
         <View style={styles.modalRoot}>
-          <Pressable style={styles.modalBackdrop} onPress={() => setSheet(null)} />
+          <Pressable style={styles.modalBackdrop} onPress={() => setFilmSheetOpen(false)} />
           <View style={styles.sheetPanel}>
             <View style={styles.sheetHandle} />
-            {sheet ? renderSheet(sheet) : null}
+            {renderFilmSheet()}
           </View>
         </View>
       </Modal>
 
       <Modal
-        visible={galleryViewerAssets != null && galleryViewerAssets.length > 0}
+        visible={filterSheetOpen}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setFilterSheetOpen(false)}
+      >
+        <View style={styles.modalRoot}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setFilterSheetOpen(false)} />
+          <View style={styles.sheetPanel}>
+            <View style={styles.sheetHandle} />
+            {renderFilterSheet()}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={pickedGalleryPreviewUri != null}
         animationType="fade"
         transparent
         statusBarTranslucent
         presentationStyle="overFullScreen"
-        onRequestClose={closeGalleryViewer}
+        onRequestClose={closePickedGalleryPreview}
       >
         <View style={[styles.viewerModalRoot, { paddingTop: insets.top }]}>
           <View style={styles.viewerTopBar}>
             <Pressable
-              onPress={closeGalleryViewer}
+              onPress={closePickedGalleryPreview}
               style={styles.viewerCloseBtn}
               accessibilityLabel="关闭相册预览"
             >
               <Text style={styles.viewerCloseBtnText}>关闭</Text>
             </Pressable>
             <Text style={styles.viewerCount} accessibilityLiveRegion="polite">
-              {galleryViewerAssets != null && galleryViewerAssets.length > 0
-                ? `${galleryViewerIndex + 1} / ${galleryViewerAssets.length}`
-                : ''}
+              相册预览
             </Text>
             <View style={styles.viewerCloseBtnPlaceholder} />
           </View>
-          <FlatList
-            style={styles.viewerList}
-            data={galleryViewerAssets ?? []}
-            horizontal
-            pagingEnabled
-            showsHorizontalScrollIndicator={false}
-            keyExtractor={(item, index) => `${item.id}-${index}`}
-            renderItem={({ item }) => (
-              <GallerySlide
-                asset={item}
-                pageWidth={windowWidth}
-                onImageError={onGallerySlideImageError}
+          {pickedGalleryPreviewUri ? (
+            <View style={styles.viewerPage}>
+              <Image
+                testID="picked-gallery-preview-image"
+                accessibilityLabel="已选照片预览"
+                source={{ uri: pickedGalleryPreviewUri }}
+                style={styles.viewerPageImage}
+                resizeMode="contain"
+                onError={onPickedGalleryImageError}
               />
-            )}
-            onViewableItemsChanged={onGalleryViewableRef.current}
-            viewabilityConfig={viewabilityConfigGallery}
-            getItemLayout={(_, index) => ({
-              length: windowWidth,
-              offset: windowWidth * index,
-              index,
-            })}
-            initialNumToRender={2}
-            maxToRenderPerBatch={3}
-            windowSize={3}
-          />
+            </View>
+          ) : null}
           <View style={[styles.viewerFooterHint, { paddingBottom: Math.max(insets.bottom, 12) }]}>
-            <Text style={styles.viewerCloseHintText}>左右滑动查看其他照片</Text>
+            <Text style={styles.viewerCloseHintText}>在系统相册中选取；再次点击左下角可换一张</Text>
           </View>
         </View>
       </Modal>
@@ -612,12 +593,6 @@ export function RetroCameraScreen() {
         <View style={styles.retroBrandBlock}>
           <Text style={styles.retroBrandLine}>RETRO FILM</Text>
           <Text style={styles.retroBrandLineSmall}>CAMERA</Text>
-        </View>
-        <View style={styles.retroExpBox}>
-          <Text style={styles.retroExpText}>
-            <Text style={styles.retroExpDot}>● </Text>
-            000 EXP
-          </Text>
         </View>
         <View style={styles.retroHeaderRight}>
           <Pressable
@@ -660,7 +635,7 @@ export function RetroCameraScreen() {
           <View
             pointerEvents="none"
             style={[
-              previewMultiplyLayerBase,
+              previewTintLayerBase,
               {
                 backgroundColor: preset.previewTint,
                 opacity: preset.previewOpacity,
@@ -671,7 +646,7 @@ export function RetroCameraScreen() {
             <View
               pointerEvents="none"
               style={[
-                previewMultiplyLayerBase,
+                previewTintLayerBase,
                 {
                   backgroundColor: filter.previewOverlay.color,
                   opacity: filter.previewOverlay.opacity,
@@ -691,8 +666,25 @@ export function RetroCameraScreen() {
             <Text style={styles.vertBrandText}>RETROCAM PRO</Text>
           </View>
           <View style={styles.previewHintBox} pointerEvents="none">
-            <Text style={styles.previewHint}>成片保存至相册；预览为叠色示意</Text>
+            <Text style={styles.previewHint}>
+              成片保存至相册；预览为近似叠色（与矩阵成片仍有差异）
+            </Text>
           </View>
+          {isRecording ? (
+            <View style={styles.recTimerWrap} pointerEvents="none">
+              <View style={styles.recTimerPill}>
+                <View style={styles.recDot} />
+                <Text
+                  testID="recording-duration"
+                  style={styles.recTimerText}
+                  accessibilityLiveRegion="polite"
+                  accessibilityLabel={`录制中，时长 ${formatRecordingDuration(recordingElapsedSec)}`}
+                >
+                  {formatRecordingDuration(recordingElapsedSec)}
+                </Text>
+              </View>
+            </View>
+          ) : null}
           <View style={styles.filterBadge} pointerEvents="none">
             <Text style={styles.filterBadgeText}>
               {preset.label} · {filter.label}
@@ -724,34 +716,32 @@ export function RetroCameraScreen() {
 
       <View style={styles.featureStrip}>
         <Pressable
-          testID="open-camera-sheet"
+          testID="open-film-sheet"
           style={styles.featureToolCol}
-          onPress={() => setSheet('camera')}
-          accessibilityLabel={`相机风格，当前 ${preset.label}`}
+          onPress={() => {
+            setFilterSheetOpen(false);
+            setFilmSheetOpen(true);
+          }}
+          accessibilityLabel={`胶片模式，当前 ${preset.label}`}
         >
-          <View
-            style={[styles.featureCircle, sheet === 'camera' && styles.featureCircleActive]}
-          >
-            <View style={styles.topToolCamGlyph}>
-              <View style={styles.topToolCamLens} />
-              <View style={styles.topToolCamBody} />
-            </View>
+          <View style={[styles.featureCircle, filmSheetOpen && styles.featureCircleActive]}>
+            <Ionicons name="film-outline" size={28} color={C.gold} />
           </View>
-          <View style={styles.featureCaptionSpacer} />
         </Pressable>
         <Pressable
           testID="open-filter-sheet"
           style={styles.featureToolCol}
-          onPress={() => setSheet('filter')}
+          onPress={() => {
+            setFilmSheetOpen(false);
+            setFilterSheetOpen(true);
+          }}
           accessibilityLabel={`滤镜，当前 ${filter.label}`}
         >
-          <View style={[styles.featureCircle, sheet === 'filter' && styles.featureCircleActive]}>
-            <View style={styles.topToolSwatch}>
-              <View style={[styles.topToolSwatchHalf, { backgroundColor: filterSwatch(filter)[0] }]} />
-              <View style={[styles.topToolSwatchHalf, { backgroundColor: filterSwatch(filter)[1] }]} />
-            </View>
+          <View
+            style={[styles.featureCircle, filterSheetOpen && styles.featureCircleActive]}
+          >
+            <Ionicons name="color-filter-outline" size={28} color={C.gold} />
           </View>
-          <View style={styles.featureCaptionSpacer} />
         </Pressable>
         <Pressable
           style={styles.featureToolCol}
@@ -761,7 +751,6 @@ export function RetroCameraScreen() {
           <View style={[styles.featureCircle, showGrid && styles.featureCircleActive]}>
             <GridGlyph active={showGrid} />
           </View>
-          <Text style={styles.featureCaption}>九宫格</Text>
         </Pressable>
         <Pressable
           style={styles.featureToolCol}
@@ -781,7 +770,6 @@ export function RetroCameraScreen() {
               {flashMode === 'off' ? <View style={styles.flashSlash} /> : null}
             </View>
           </View>
-          <Text style={styles.featureCaption}>闪光</Text>
         </Pressable>
       </View>
 
@@ -796,25 +784,20 @@ export function RetroCameraScreen() {
         <View style={styles.bottomSide}>
           <Pressable
             testID="open-gallery"
-            style={styles.galleryStackPress}
+            style={styles.bottomSidePress}
             onPress={() => void openGallery()}
             accessibilityLabel="相册"
           >
-            <View style={styles.galleryStackStage}>
-              <View style={[styles.galleryStackSheet, styles.galleryStackSheetBack]} />
-              <View style={[styles.galleryStackSheet, styles.galleryStackSheetMid]} />
-              <View style={[styles.galleryStackSheet, styles.galleryStackSheetFront]}>
-                {galleryUri ? (
-                  <Image source={{ uri: galleryUri }} style={styles.galleryStackImg} />
-                ) : (
-                  <View style={styles.galleryStackEmpty}>
-                    <Text style={styles.galleryStackEmptyTxt}>+</Text>
-                  </View>
-                )}
-                <View style={styles.galleryPlayCorner}>
-                  <Text style={styles.galleryPlayGlyph}>▶</Text>
-                </View>
-              </View>
+            <View style={styles.bottomSideCircle}>
+              {galleryUri ? (
+                <Image
+                  source={{ uri: galleryUri }}
+                  style={styles.galleryCircleImage}
+                  resizeMode="cover"
+                />
+              ) : (
+                <Ionicons name="images-outline" size={26} color={C.goldMuted} />
+              )}
             </View>
           </Pressable>
         </View>
@@ -829,17 +812,15 @@ export function RetroCameraScreen() {
               <View style={[styles.shutterMetalCore, isRecording && styles.shutterMetalCoreRec]} />
             </View>
           </Pressable>
-          <Text style={styles.shutterLabel}>SHUTTER</Text>
         </View>
         <View style={styles.bottomSide}>
           <Pressable
-            style={styles.flipBtn}
+            style={styles.bottomSidePress}
             onPress={() => setFacing((f) => (f === 'back' ? 'front' : 'back'))}
             accessibilityLabel="翻转相机"
           >
-            <View style={styles.flipIcon}>
-              <Text style={styles.flipIconGlyph}>↻</Text>
-              <View style={styles.flipCamDot} />
+            <View style={styles.bottomSideCircle}>
+              <Ionicons name="camera-reverse" size={30} color={C.gold} />
             </View>
           </Pressable>
         </View>
@@ -927,7 +908,7 @@ const styles = StyleSheet.create({
     paddingTop: 2,
     paddingBottom: 8,
   },
-  retroBrandBlock: { flex: 1.1 },
+  retroBrandBlock: { flex: 1 },
   retroBrandLine: {
     color: C.gold,
     fontSize: 11,
@@ -941,24 +922,8 @@ const styles = StyleSheet.create({
     letterSpacing: 3,
     marginTop: 2,
   },
-  retroExpBox: {
-    borderWidth: 1,
-    borderColor: C.goldMuted,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 3,
-    backgroundColor: 'rgba(0,0,0,0.35)',
-  },
-  retroExpText: {
-    color: C.gold,
-    fontSize: 11,
-    fontVariant: ['tabular-nums'],
-    letterSpacing: 0.5,
-    fontWeight: '600',
-  },
-  retroExpDot: { color: '#c45c5c' },
   retroHeaderRight: {
-    flex: 1.1,
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'flex-end',
@@ -1010,7 +975,7 @@ const styles = StyleSheet.create({
   },
   featureStrip: {
     flexDirection: 'row',
-    alignItems: 'flex-end',
+    alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 20,
     paddingTop: 4,
@@ -1034,14 +999,6 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(201,169,98,0.75)',
     backgroundColor: 'rgba(201,169,98,0.1)',
   },
-  featureCaption: {
-    marginTop: 5,
-    fontSize: 10,
-    color: C.goldMuted,
-    fontWeight: '500',
-    letterSpacing: 0.5,
-  },
-  featureCaptionSpacer: { height: 19 },
   flashIconBox: {
     width: 30,
     height: 30,
@@ -1083,42 +1040,6 @@ const styles = StyleSheet.create({
     width: 120,
     textAlign: 'center',
   },
-  topToolCamGlyph: {
-    position: 'relative',
-    width: 26,
-    height: 22,
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-  },
-  topToolCamLens: {
-    position: 'absolute',
-    top: 0,
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    borderWidth: 1.5,
-    borderColor: C.gold,
-    backgroundColor: 'rgba(212,175,55,0.12)',
-  },
-  topToolCamBody: {
-    width: 22,
-    height: 11,
-    borderBottomLeftRadius: 3,
-    borderBottomRightRadius: 3,
-    borderTopLeftRadius: 4,
-    borderTopRightRadius: 4,
-    borderWidth: 1.5,
-    borderColor: C.gold,
-    marginTop: 8,
-  },
-  topToolSwatch: {
-    width: 28,
-    height: 28,
-    borderRadius: 9,
-    overflow: 'hidden',
-    flexDirection: 'row',
-  },
-  topToolSwatchHalf: { flex: 1 },
   modeRow: {
     flexDirection: 'row',
     alignSelf: 'center',
@@ -1155,15 +1076,15 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 0,
     bottom: 0,
-    width: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(255,255,255,0.35)',
+    width: 2,
+    backgroundColor: 'rgba(255,255,255,0.5)',
   },
   gridLineH: {
     position: 'absolute',
     left: 0,
     right: 0,
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(255,255,255,0.35)',
+    height: 2,
+    backgroundColor: 'rgba(255,255,255,0.5)',
   },
   previewPlaceholder: {
     ...StyleSheet.absoluteFillObject,
@@ -1182,6 +1103,37 @@ const styles = StyleSheet.create({
   previewHint: {
     color: 'rgba(255,255,255,0.85)',
     fontSize: 13,
+    letterSpacing: 0.5,
+  },
+  recTimerWrap: {
+    position: 'absolute',
+    top: 40,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  recTimerPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  recDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#e04545',
+  },
+  recTimerText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
     letterSpacing: 0.5,
   },
   filterBadge: {
@@ -1217,62 +1169,26 @@ const styles = StyleSheet.create({
   },
   bottomSide: { flex: 1, alignItems: 'center', justifyContent: 'flex-end', paddingBottom: 4 },
   bottomCenter: { alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
-  galleryStackPress: {
-    paddingVertical: 4,
-    paddingHorizontal: 4,
+  bottomSidePress: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingBottom: 8,
   },
-  galleryStackStage: {
-    width: 56,
+  bottomSideCircle: {
+    width: 52,
     height: 52,
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-  },
-  galleryStackSheet: {
-    position: 'absolute',
-    width: 44,
-    height: 44,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: C.goldMuted,
-    backgroundColor: C.panel,
-  },
-  galleryStackSheetBack: {
-    transform: [{ translateX: -6 }, { translateY: -10 }, { rotate: '-8deg' }],
-    opacity: 0.4,
-  },
-  galleryStackSheetMid: {
-    transform: [{ translateX: 5 }, { translateY: -5 }, { rotate: '6deg' }],
-    opacity: 0.62,
-  },
-  galleryStackSheetFront: {
-    transform: [{ translateY: 2 }],
-    overflow: 'hidden',
-    alignItems: 'center',
-    justifyContent: 'center',
+    borderRadius: 26,
     backgroundColor: C.surface,
-  },
-  galleryStackImg: { width: '100%', height: '100%' },
-  galleryStackEmpty: {
-    ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#1f1a16',
+    borderWidth: 1.5,
+    borderColor: 'rgba(201,169,98,0.45)',
+    overflow: 'hidden',
   },
-  galleryStackEmptyTxt: { color: C.goldMuted, fontSize: 22, fontWeight: '300' },
-  galleryPlayCorner: {
-    position: 'absolute',
-    right: 3,
-    bottom: 3,
-    width: 15,
-    height: 15,
-    borderRadius: 8,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(201,169,98,0.35)',
+  galleryCircleImage: {
+    width: '100%',
+    height: '100%',
   },
-  galleryPlayGlyph: { color: C.goldBright, fontSize: 7, marginLeft: 1 },
   shutter: {
     width: 84,
     height: 84,
@@ -1324,40 +1240,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#a22',
     borderColor: 'rgba(255,255,255,0.15)',
   },
-  shutterLabel: {
-    marginTop: 6,
-    fontSize: 9,
-    letterSpacing: 2,
-    fontWeight: '700',
-    color: C.goldMuted,
-  },
-  flipBtn: { alignItems: 'center', justifyContent: 'center', paddingBottom: 8 },
-  flipIcon: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    backgroundColor: C.surface,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
-  },
-  flipIconGlyph: {
-    fontSize: 26,
-    color: C.gold,
-    fontWeight: '300',
-    marginTop: -2,
-  },
-  flipCamDot: {
-    position: 'absolute',
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    backgroundColor: C.gold,
-    opacity: 0.85,
-    bottom: 12,
-    right: 12,
-  },
   viewerModalRoot: {
     flex: 1,
     backgroundColor: '#000',
@@ -1387,16 +1269,10 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontVariant: ['tabular-nums'],
   },
-  viewerList: { flex: 1 },
   viewerPage: {
     flex: 1,
     justifyContent: 'center',
     backgroundColor: '#000',
-  },
-  viewerSlideLoading: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
   viewerPageImage: {
     width: '100%',

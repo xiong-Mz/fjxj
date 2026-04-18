@@ -107,6 +107,19 @@ export const PRESETS: RetroPreset[] = [
   },
 ];
 
+/** 无胶片矩阵、预览不叠色；成片仅叠加当前「滤镜」矩阵 */
+export const ORIGINAL_PRESET: RetroPreset = {
+  id: 'original',
+  label: '原相机',
+  matrix: [...IDENTITY],
+  previewTint: '#ffffff',
+  previewOpacity: 0,
+  swatch: ['#d0d0d0', '#404040'],
+};
+
+/** 胶片模式：默认首项为 {@link ORIGINAL_PRESET}，其余同 {@link PRESETS} */
+export const FILM_MODE_OPTIONS: RetroPreset[] = [ORIGINAL_PRESET, ...PRESETS];
+
 export type FilmFilter = {
   id: string;
   label: string;

@@ -23,6 +23,14 @@ jest.mock('react-native-safe-area-context', () => {
   };
 });
 
+jest.mock('@expo/vector-icons', () => {
+  const React = require('react');
+  const { View } = require('react-native');
+  return {
+    Ionicons: (props) => React.createElement(View, props),
+  };
+});
+
 jest.mock('./src/FilmProcessor', () => ({
   FilmProcessor: () => null,
 }));
@@ -70,6 +78,19 @@ jest.mock('expo-media-library', () => ({
 jest.mock('expo-image-manipulator', () => ({
   manipulateAsync: jest.fn((uri) => Promise.resolve({ uri, width: 800, height: 600 })),
   SaveFormat: { JPEG: 'jpeg', PNG: 'png', WEBP: 'webp' },
+}));
+
+jest.mock('expo-image-picker', () => ({
+  MediaTypeOptions: { Images: 'images', Videos: 'videos', All: 'all' },
+  getMediaLibraryPermissionsAsync: jest.fn(() =>
+    Promise.resolve({ status: 'granted', granted: true, expires: 'never', canAskAgain: true }),
+  ),
+  requestMediaLibraryPermissionsAsync: jest.fn(() =>
+    Promise.resolve({ status: 'granted', granted: true, expires: 'never', canAskAgain: true }),
+  ),
+  launchImageLibraryAsync: jest.fn(() =>
+    Promise.resolve({ canceled: true, assets: null }),
+  ),
 }));
 
 jest.mock('expo-status-bar', () => ({

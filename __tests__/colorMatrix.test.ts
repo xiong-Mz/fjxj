@@ -1,6 +1,8 @@
 import {
   FILTERS,
+  FILM_MODE_OPTIONS,
   IDENTITY,
+  ORIGINAL_PRESET,
   PRESETS,
   combinedMatrix,
   multiplyColorMatrices,
@@ -90,6 +92,12 @@ describe('combinedMatrix', () => {
     const diff = a.some((v, i) => Math.abs(v - b[i]) > 1e-6);
     expect(diff).toBe(true);
   });
+
+  it('原相机 preset yields same matrix as filter alone', () => {
+    const filter = FILTERS[3];
+    const c = combinedMatrix(ORIGINAL_PRESET, filter);
+    expectClose(c, filter.matrix);
+  });
 });
 
 describe('SPEC data: PRESETS / FILTERS', () => {
@@ -110,8 +118,14 @@ describe('SPEC data: PRESETS / FILTERS', () => {
     expect(PRESETS[0].label).toBe('自动胶');
   });
 
+  it('film mode list starts with 原相机 then all presets', () => {
+    expect(FILM_MODE_OPTIONS[0]).toBe(ORIGINAL_PRESET);
+    expect(FILM_MODE_OPTIONS.length).toBe(1 + PRESETS.length);
+    expect(FILM_MODE_OPTIONS[1]).toBe(PRESETS[0]);
+  });
+
   it('preset and filter labels are at most 3 characters', () => {
-    for (const p of PRESETS) {
+    for (const p of FILM_MODE_OPTIONS) {
       expect([...p.label].length).toBeLessThanOrEqual(3);
     }
     for (const f of FILTERS) {
@@ -120,6 +134,7 @@ describe('SPEC data: PRESETS / FILTERS', () => {
   });
 
   it('each matrix has length 20', () => {
+    expect(ORIGINAL_PRESET.matrix).toHaveLength(20);
     for (const p of PRESETS) {
       expect(p.matrix).toHaveLength(20);
     }
