@@ -1,12 +1,30 @@
 {
   "expo": {
-    "name": "retro-camera",
-    "slug": "retro-camera",
+    "name": "复古相机",
+    "slug": "fgxj",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "用于拍照与录像预览。",
+          "microphonePermission": "用于录制视频中的声音。",
+          "recordAudioAndroid": true
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "用于将照片与视频保存到系统相册。",
+          "savePhotosPermission": "用于将照片与视频保存到系统相册。",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ],
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -20,11 +38,23 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_MEDIA_LOCATION"
+      ],
+      "package": "com.xiongmozhou.retrocamera"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "937a52f5-7388-46fd-b263-c3a13bbd705d"
+      }
+    },
+    "owner": "xiongmozhous-organization"
   }
 }
