@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { InteractionManager, StyleSheet, View } from 'react-native';
 import {
   Canvas,
@@ -10,17 +10,41 @@ import {
 } from '@shopify/react-native-skia';
 import * as FileSystem from 'expo-file-system';
 
+import {
+  computeWatermarkRect,
+  getWatermarkAssetSource,
+  getWatermarkRenderConfig,
+  isImageWatermarkStyle,
+  type WatermarkStyleId,
+} from './watermarkConfig';
+
 type Props = {
   uri: string;
   width: number;
   height: number;
   matrix: number[];
+  /** 非 none 时在成片底部居中叠加透明 PNG 角标 */
+  watermarkStyle?: WatermarkStyleId;
   onExported: (fileUri: string) => void;
   onError: (e: Error) => void;
 };
 
-export function FilmProcessor({ uri, width, height, matrix, onExported, onError }: Props) {
+export function FilmProcessor({
+  uri,
+  width,
+  height,
+  matrix,
+  watermarkStyle = 'none',
+  onExported,
+  onError,
+}: Props) {
   const image = useImage(uri);
+  const wmSource = isImageWatermarkStyle(watermarkStyle)
+    ? getWatermarkAssetSource(watermarkStyle)
+    : null;
+  const wmImage = useImage(wmSource);
+  const wmCfg = useMemo(() => getWatermarkRenderConfig(watermarkStyle), [watermarkStyle]);
+
   const ref = useCanvasRef();
   const onExportedRef = useRef(onExported);
   const onErrorRef = useRef(onError);
@@ -28,9 +52,19 @@ export function FilmProcessor({ uri, width, height, matrix, onExported, onError 
   onErrorRef.current = onError;
 
   const matrixKey = matrix.join(',');
+  const wmKey = watermarkStyle === 'none' ? '' : watermarkStyle;
+
+  const wmLayout = useMemo(() => {
+    if (!wmImage) return null;
+    const iw = wmImage.width();
+    const ih = wmImage.height();
+    if (iw <= 0 || ih <= 0) return null;
+    return computeWatermarkRect(width, height, iw, ih, wmCfg.scale);
+  }, [height, width, wmCfg.scale, wmImage]);
 
   useEffect(() => {
     if (!image || !FileSystem.cacheDirectory) return;
+    if (isImageWatermarkStyle(watermarkStyle) && !wmImage) return;
     let cancelled = false;
 
     const run = async () => {
@@ -58,9 +92,11 @@ export function FilmProcessor({ uri, width, height, matrix, onExported, onError 
     return () => {
       cancelled = true;
     };
-  }, [image, uri, width, height, matrixKey]);
+  }, [image, uri, width, height, matrixKey, watermarkStyle, wmImage, wmKey]);
 
   if (!FileSystem.cacheDirectory) return null;
+
+  const showWm = wmLayout && wmImage;
 
   return (
     <View style={[styles.offscreen, { width, height }]} pointerEvents="none">
@@ -69,6 +105,17 @@ export function FilmProcessor({ uri, width, height, matrix, onExported, onError 
           <Image x={0} y={0} width={width} height={height} image={image} fit="cover">
             <ColorMatrix matrix={matrix} />
           </Image>
+          {showWm ? (
+            <Image
+              x={wmLayout.x}
+              y={wmLayout.y}
+              width={wmLayout.w}
+              height={wmLayout.h}
+              image={wmImage}
+              fit="fill"
+              opacity={wmCfg.opacity}
+            />
+          ) : null}
         </Canvas>
       ) : null}
     </View>

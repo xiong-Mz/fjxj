@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -35,6 +35,14 @@ import {
 import { FilmProcessor } from './FilmProcessor';
 import { resolveAssetDisplayUri } from './galleryAssetUri';
 import { getMediaLibraryAccessRequestOptions } from './mediaLibraryPermission';
+import {
+  WATERMARK_OPTIONS,
+  computeWatermarkRect,
+  getWatermarkAssetSource,
+  getWatermarkRenderConfig,
+  isImageWatermarkStyle,
+  type WatermarkStyleId,
+} from './watermarkConfig';
 
 /**
  * 取景叠层与成片差异说明：
@@ -75,6 +83,7 @@ type ExportJob = {
   height: number;
   matrix: number[];
   fallbackUri: string;
+  watermarkStyle: WatermarkStyleId;
 };
 
 function SwatchTile({
@@ -94,6 +103,40 @@ function SwatchTile({
         <View style={styles.sheetSwatch}>
           <View style={[styles.sheetSwatchHalf, { backgroundColor: colors[0] }]} />
           <View style={[styles.sheetSwatchHalf, { backgroundColor: colors[1] }]} />
+        </View>
+      </View>
+      <Text style={[styles.sheetTileLabel, selected && styles.sheetTileLabelOn]} numberOfLines={1}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+function WatermarkTile({
+  label,
+  selected,
+  onPress,
+  source,
+}: {
+  label: string;
+  selected: boolean;
+  onPress: () => void;
+  source: number | null;
+}) {
+  return (
+    <Pressable onPress={onPress} style={styles.sheetTile}>
+      <View style={[styles.sheetSwatchOuter, selected && styles.sheetSwatchOuterOn]}>
+        <View style={styles.watermarkThumbBox}>
+          {source ? (
+            <Image
+              source={source}
+              style={styles.watermarkThumbImage}
+              resizeMode="contain"
+              accessibilityLabel={label}
+            />
+          ) : (
+            <Ionicons name="close" size={22} color={C.goldMuted} />
+          )}
         </View>
       </View>
       <Text style={[styles.sheetTileLabel, selected && styles.sheetTileLabelOn]} numberOfLines={1}>
@@ -136,6 +179,10 @@ export function RetroCameraScreen() {
   const [filmModeIndex, setFilmModeIndex] = useState(0);
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const [filmSheetOpen, setFilmSheetOpen] = useState(false);
+  const [watermarkSheetOpen, setWatermarkSheetOpen] = useState(false);
+  const [watermarkStyle, setWatermarkStyle] = useState<WatermarkStyleId>('none');
+  /** 取景卡片像素尺寸，用于与成片同一公式叠水印预览 */
+  const [previewLayout, setPreviewLayout] = useState<{ w: number; h: number } | null>(null);
   const [flashMode, setFlashMode] = useState<FlashMode>('off');
   const [showGrid, setShowGrid] = useState(false);
   const [galleryUri, setGalleryUri] = useState<string | null>(null);
@@ -155,6 +202,28 @@ export function RetroCameraScreen() {
 
   const preset = FILM_MODE_OPTIONS[filmModeIndex];
   const filter = FILTERS[filterIndex];
+
+  const wmAssetPx = useMemo(() => {
+    if (!isImageWatermarkStyle(watermarkStyle)) return null;
+    const src = getWatermarkAssetSource(watermarkStyle);
+    if (src == null) return null;
+    const r = Image.resolveAssetSource(src);
+    if (r && r.width > 0 && r.height > 0) return { w: r.width, h: r.height };
+    return { w: 480, h: 100 };
+  }, [watermarkStyle]);
+
+  const wmRenderCfg = useMemo(() => getWatermarkRenderConfig(watermarkStyle), [watermarkStyle]);
+
+  const wmPreviewRect = useMemo(() => {
+    if (!previewLayout || !wmAssetPx) return null;
+    return computeWatermarkRect(
+      previewLayout.w,
+      previewLayout.h,
+      wmAssetPx.w,
+      wmAssetPx.h,
+      wmRenderCfg.scale,
+    );
+  }, [previewLayout, wmAssetPx, wmRenderCfg.scale]);
 
   const filterSwatch = (f: FilmFilter): [string, string] =>
     f.swatch ?? ['#3d3d46', '#1a1a1f'];
@@ -361,6 +430,7 @@ export function RetroCameraScreen() {
         height: sized.height,
         matrix,
         fallbackUri: raw.uri,
+        watermarkStyle,
       });
     } catch (e) {
       Alert.alert('拍照失败', e instanceof Error ? e.message : String(e));
@@ -373,6 +443,7 @@ export function RetroCameraScreen() {
     requestCameraPermission,
     resizeForPipeline,
     scheduleExportJob,
+    watermarkStyle,
   ]);
 
   const toggleRecord = useCallback(async () => {
@@ -445,6 +516,11 @@ export function RetroCameraScreen() {
     setFilmSheetOpen(false);
   }, []);
 
+  const selectWatermarkStyle = useCallback((id: WatermarkStyleId) => {
+    setWatermarkStyle(id);
+    setWatermarkSheetOpen(false);
+  }, []);
+
   const permBanner =
     cameraPermission && !cameraPermission.granted ? (
       <View style={styles.banner}>
@@ -471,6 +547,28 @@ export function RetroCameraScreen() {
             label={p.label}
             selected={i === filmModeIndex}
             onPress={() => selectFilmMode(i)}
+          />
+        ))}
+      </ScrollView>
+    </>
+  );
+
+  const renderWatermarkSheet = () => (
+    <>
+      <Text style={styles.sheetSectionTitle}>水印</Text>
+      <Text style={styles.sheetHint}>选择水印（放入 plugins 目录后会自动出现在列表）</Text>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.sheetScroll}
+      >
+        {WATERMARK_OPTIONS.map((opt) => (
+          <WatermarkTile
+            key={opt.id}
+            label={opt.label}
+            selected={watermarkStyle === opt.id}
+            source={getWatermarkAssetSource(opt.id)}
+            onPress={() => selectWatermarkStyle(opt.id)}
           />
         ))}
       </ScrollView>
@@ -507,11 +605,12 @@ export function RetroCameraScreen() {
 
       {activeExportJob ? (
         <FilmProcessor
-          key={`${activeExportJob.uri}-${activeExportJob.matrix.join(',')}`}
+          key={`${activeExportJob.uri}-${activeExportJob.matrix.join(',')}-${activeExportJob.watermarkStyle}`}
           uri={activeExportJob.uri}
           width={activeExportJob.width}
           height={activeExportJob.height}
           matrix={activeExportJob.matrix}
+          watermarkStyle={activeExportJob.watermarkStyle}
           onExported={onFilmExported}
           onError={(err) => {
             void onFilmError(err, activeExportJob.fallbackUri);
@@ -545,6 +644,21 @@ export function RetroCameraScreen() {
           <View style={styles.sheetPanel}>
             <View style={styles.sheetHandle} />
             {renderFilterSheet()}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={watermarkSheetOpen}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setWatermarkSheetOpen(false)}
+      >
+        <View style={styles.modalRoot}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setWatermarkSheetOpen(false)} />
+          <View style={[styles.sheetPanel, styles.watermarkSheetPanel]}>
+            <View style={styles.sheetHandle} />
+            {renderWatermarkSheet()}
           </View>
         </View>
       </Modal>
@@ -608,7 +722,16 @@ export function RetroCameraScreen() {
       {permBanner}
 
       <View style={styles.previewFlex}>
-        <View style={styles.previewCard} collapsable={false}>
+        <View
+          style={styles.previewCard}
+          collapsable={false}
+          onLayout={(e) => {
+            const { width, height } = e.nativeEvent.layout;
+            setPreviewLayout((prev) =>
+              prev && prev.w === width && prev.h === height ? prev : { w: width, h: height },
+            );
+          }}
+        >
           {cameraPermission?.granted ? (
             <CameraView
               ref={camRef}
@@ -690,6 +813,26 @@ export function RetroCameraScreen() {
               {preset.label} · {filter.label}
             </Text>
           </View>
+          {wmPreviewRect && isImageWatermarkStyle(watermarkStyle) ? (
+            <View style={StyleSheet.absoluteFill} pointerEvents="none">
+              <Image
+                source={getWatermarkAssetSource(watermarkStyle)!}
+                style={[
+                  styles.watermarkPreviewImage,
+                  {
+                    left: wmPreviewRect.x,
+                    top: wmPreviewRect.y,
+                    width: wmPreviewRect.w,
+                    height: wmPreviewRect.h,
+                    opacity: wmRenderCfg.opacity,
+                  },
+                ]}
+                resizeMode="stretch"
+                accessibilityElementsHidden
+                importantForAccessibility="no-hide-descendants"
+              />
+            </View>
+          ) : null}
           {!cameraReady && cameraPermission?.granted ? (
             <View style={styles.busyWrap}>
               <ActivityIndicator size="large" color="#fff" />
@@ -720,12 +863,13 @@ export function RetroCameraScreen() {
           style={styles.featureToolCol}
           onPress={() => {
             setFilterSheetOpen(false);
+            setWatermarkSheetOpen(false);
             setFilmSheetOpen(true);
           }}
           accessibilityLabel={`胶片模式，当前 ${preset.label}`}
         >
           <View style={[styles.featureCircle, filmSheetOpen && styles.featureCircleActive]}>
-            <Ionicons name="film-outline" size={28} color={C.gold} />
+            <Ionicons name="film-outline" size={22} color={C.gold} />
           </View>
         </Pressable>
         <Pressable
@@ -733,6 +877,7 @@ export function RetroCameraScreen() {
           style={styles.featureToolCol}
           onPress={() => {
             setFilmSheetOpen(false);
+            setWatermarkSheetOpen(false);
             setFilterSheetOpen(true);
           }}
           accessibilityLabel={`滤镜，当前 ${filter.label}`}
@@ -740,7 +885,27 @@ export function RetroCameraScreen() {
           <View
             style={[styles.featureCircle, filterSheetOpen && styles.featureCircleActive]}
           >
-            <Ionicons name="color-filter-outline" size={28} color={C.gold} />
+            <Ionicons name="color-filter-outline" size={22} color={C.gold} />
+          </View>
+        </Pressable>
+        <Pressable
+          testID="open-watermark-sheet"
+          style={styles.featureToolCol}
+          onPress={() => {
+            setFilmSheetOpen(false);
+            setFilterSheetOpen(false);
+            setWatermarkSheetOpen(true);
+          }}
+          accessibilityLabel={`水印，当前 ${WATERMARK_OPTIONS.find((o) => o.id === watermarkStyle)?.label ?? ''}`}
+        >
+          <View
+            style={[styles.featureCircle, watermarkSheetOpen && styles.featureCircleActive]}
+          >
+            <Ionicons
+              name="water-outline"
+              size={22}
+              color={watermarkStyle === 'none' ? C.goldMuted : C.gold}
+            />
           </View>
         </Pressable>
         <Pressable
@@ -796,7 +961,7 @@ export function RetroCameraScreen() {
                   resizeMode="cover"
                 />
               ) : (
-                <Ionicons name="images-outline" size={26} color={C.goldMuted} />
+                <Ionicons name="images-outline" size={23} color={C.goldMuted} />
               )}
             </View>
           </Pressable>
@@ -820,7 +985,7 @@ export function RetroCameraScreen() {
             accessibilityLabel="翻转相机"
           >
             <View style={styles.bottomSideCircle}>
-              <Ionicons name="camera-reverse" size={30} color={C.gold} />
+              <Ionicons name="camera-reverse" size={26} color={C.gold} />
             </View>
           </Pressable>
         </View>
@@ -884,6 +1049,19 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
   },
   sheetSwatchHalf: { flex: 1 },
+  watermarkThumbBox: {
+    width: 72,
+    height: 72,
+    borderRadius: 12,
+    overflow: 'hidden',
+    backgroundColor: '#15110d',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  watermarkThumbImage: {
+    width: '100%',
+    height: '100%',
+  },
   sheetTileLabel: {
     marginTop: 8,
     fontSize: 12,
@@ -949,8 +1127,8 @@ const styles = StyleSheet.create({
   bannerBtn: { backgroundColor: C.gold, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
   bannerBtnText: { color: '#1a1a1a', fontWeight: '700', fontSize: 13 },
   gridGlyph: {
-    width: 27,
-    height: 27,
+    width: 24,
+    height: 24,
     justifyContent: 'space-between',
   },
   gridGlyphRow: {
@@ -959,8 +1137,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   gridGlyphCell: {
-    width: 7,
-    height: 7,
+    width: 6,
+    height: 6,
     borderRadius: 1.5,
   },
   gridGlyphCellOn: {
@@ -974,21 +1152,52 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   featureStrip: {
+    width: '100%',
+    alignSelf: 'stretch',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingTop: 4,
-    paddingBottom: 8,
+    paddingHorizontal: 2,
+    paddingTop: 2,
+    paddingBottom: 6,
+    minHeight: 58,
+  },
+  watermarkSheetPanel: {
+    maxHeight: '62%',
+  },
+  watermarkList: {
+    maxHeight: 320,
+    marginTop: 4,
+  },
+  watermarkRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(0,0,0,0.08)',
+  },
+  watermarkRowOn: {
+    backgroundColor: 'rgba(201,169,98,0.12)',
+    borderRadius: 10,
+  },
+  watermarkRowText: { flex: 1, paddingRight: 8 },
+  watermarkRowLabel: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#2a2824',
   },
   featureToolCol: {
+    flex: 1,
+    minWidth: 0,
     alignItems: 'center',
-    width: 72,
+    justifyContent: 'center',
   },
   featureCircle: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
     backgroundColor: C.surface,
     alignItems: 'center',
     justifyContent: 'center',
@@ -1000,17 +1209,17 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(201,169,98,0.1)',
   },
   flashIconBox: {
-    width: 30,
-    height: 30,
+    width: 24,
+    height: 24,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  flashGlyph: { fontSize: 20 },
+  flashGlyph: { fontSize: 16 },
   flashGlyphOn: { color: C.gold },
   flashGlyphOff: { color: 'rgba(255,255,255,0.35)' },
   flashSlash: {
     position: 'absolute',
-    width: 22,
+    width: 21,
     height: 2,
     backgroundColor: C.goldMuted,
     transform: [{ rotate: '-52deg' }],
@@ -1019,7 +1228,7 @@ const styles = StyleSheet.create({
   goldDivider: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: C.line,
-    marginHorizontal: 24,
+    marginHorizontal: 10,
     marginBottom: 6,
   },
   vertBrandRail: {
@@ -1152,6 +1361,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     overflow: 'hidden',
   },
+  watermarkPreviewImage: {
+    position: 'absolute',
+  },
   busyWrap: {
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
@@ -1175,9 +1387,9 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   bottomSideCircle: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
     backgroundColor: C.surface,
     alignItems: 'center',
     justifyContent: 'center',
@@ -1190,9 +1402,9 @@ const styles = StyleSheet.create({
     height: '100%',
   },
   shutter: {
-    width: 84,
-    height: 84,
-    borderRadius: 42,
+    width: 76,
+    height: 76,
+    borderRadius: 38,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#2a221c',
@@ -1209,9 +1421,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#3d1818',
   },
   shutterMetal: {
-    width: 66,
-    height: 66,
-    borderRadius: 33,
+    width: 60,
+    height: 60,
+    borderRadius: 30,
     backgroundColor: '#b8924a',
     borderWidth: 3,
     borderTopColor: '#e8d5a8',
@@ -1229,9 +1441,9 @@ const styles = StyleSheet.create({
     borderBottomColor: '#511',
   },
   shutterMetalCore: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: '#9a7a3e',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.22)',

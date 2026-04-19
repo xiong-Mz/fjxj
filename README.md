@@ -10,6 +10,38 @@
 - **相册**：拉取最近照片列表后**立即**打开全屏预览；`content` / `file` 等 URI 即时显示，`ph://` 等在单页内按需 `getAssetInfoAsync` 解析，避免一次性阻塞。
 - **权限**：相机、麦克风、相册读写（见 `app.json` 中 `expo-camera` / `expo-media-library` 配置）。
 
+## 水印（插件目录 + 自动生成）
+
+成片与取景预览会在**画面底部居中**叠一张透明位图（PNG 等），尺寸与位置由同一套公式计算。所有角标图片都放在 **`assets/watermarks/plugins/`**，由脚本扫描后生成静态 `require` 注册表并出现在水印选项里（无单独「内置」资源目录）。
+
+### 使用方式
+
+1. **目录**：将图片放入 **`assets/watermarks/plugins/`**。
+2. **格式**：`.png`、`.webp`、`.jpg`、`.jpeg`（不区分大小写）。
+3. **列表文案**：选项标题默认使用**文件名去掉扩展名**；内部 id 为 `plugin_` + 由文件名整理出的 slug（重名时会自动加后缀避免冲突）。
+4. **为何需要脚本**：Metro 打包要求 `require()` 路径在构建期可静态分析，因此不能运行时扫文件夹；仓库内脚本会扫描插件目录并生成 **`src/watermarkPlugins.generated.ts`**（**不要手改该文件**）。
+5. **何时自动同步**（会重写 `watermarkPlugins.generated.ts`）：
+   - `npm install`（`postinstall`）
+   - `npm start`（`prestart`）
+   - `npm test`（`pretest`）
+6. **手动同步**：在增删插件图片后也可执行：
+
+   ```bash
+   npm run sync-watermarks
+   ```
+
+7. **协作 / CI**：添加或删除 `plugins/` 下的图片后，请把**更新后的 `src/watermarkPlugins.generated.ts` 一并提交**，否则他人克隆后列表会与你的本地不一致。
+
+### 相关源码
+
+| 文件 | 作用 |
+|------|------|
+| `scripts/sync-watermark-plugins.mjs` | 扫描 `plugins/`，生成注册表 |
+| `src/watermarkPlugins.generated.ts` | 插件列表与静态 `require`（自动生成） |
+| `src/watermarkConfig.ts` | 「关闭」+ 插件选项、`getWatermarkAssetSource` |
+| `src/FilmProcessor.tsx` | 成片 Skia 叠加水印 |
+| `src/RetroCameraScreen.tsx` | 水印抽屉与取景预览叠图 |
+
 ## 技术栈
 
 | 类别 | 技术 |
@@ -58,6 +90,7 @@ npm run ios
 | `npm test` | Jest 单测 |
 | `npm run test:watch` | 监听模式 |
 | `npm run test:ci` | CI 用（串行、`--forceExit`） |
+| `npm run sync-watermarks` | 扫描 `assets/watermarks/plugins/`，生成 `src/watermarkPlugins.generated.ts` |
 
 类型检查：
 
@@ -82,14 +115,20 @@ retro-camera/
 ├── App.tsx                 # 入口，挂载 RetroCameraScreen
 ├── app.json                # Expo 配置与插件权限文案
 ├── eas.json                # EAS Build 配置
+├── scripts/
+│   └── sync-watermark-plugins.mjs  # 生成水印插件注册表
 ├── src/
 │   ├── RetroCameraScreen.tsx   # 主界面：取景、模式、相册、导出队列
 │   ├── FilmProcessor.tsx       # Skia 离屏导出 JPEG
+│   ├── watermarkConfig.ts      # 水印选项与资源解析
+│   ├── watermarkPlugins.generated.ts  # 插件水印（npm 脚本生成，勿手改）
 │   ├── colorMatrix.ts          # 预设 / 滤镜矩阵与组合
 │   ├── galleryAssetUri.ts      # 相册资源 URI 解析
 │   └── mediaLibraryPermission.ts
 ├── __tests__/              # Jest 测试
-└── assets/                 # 图标与启动图
+└── assets/                 # 图标、启动图、水印资源
+    └── watermarks/
+        └── plugins/          # 角标 PNG 等（放入即参与 sync）
 ```
 
 ## 测试与质量

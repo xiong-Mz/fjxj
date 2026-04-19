@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "main": "index.ts",
   "scripts": {
+    "sync-watermarks": "node scripts/sync-watermark-plugins.mjs",
+    "prestart": "npm run sync-watermarks",
+    "pretest": "npm run sync-watermarks",
+    "postinstall": "npm run sync-watermarks",
     "start": "expo start --host lan",
     "start:localhost": "expo start --host localhost",
     "android": "expo start --android --host lan",

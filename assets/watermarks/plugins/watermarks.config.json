@@ -1,0 +1,12 @@
+{
+  "$schema": "https://example.invalid/retro-camera/watermarks.config.schema.json",
+  "defaults": {
+    "opacity": 0.95,
+    "scale": 1.0
+  },
+  "watermarks": {
+    "action5Pro": { "opacity": 0.95, "scale": 1.0 },
+    "pocket3": { "opacity": 0.95, "scale": 0.8 }
+  }
+}
+
