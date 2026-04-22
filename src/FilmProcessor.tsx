@@ -12,19 +12,21 @@ import * as FileSystem from 'expo-file-system';
 
 import {
   computeWatermarkRect,
+  computeWatermarkRectWithAnchor,
+  computeWatermarkRectWithPlacement,
   getWatermarkAssetSource,
   getWatermarkRenderConfig,
   isImageWatermarkStyle,
-  type WatermarkStyleId,
 } from './watermarkConfig';
+import type { WatermarkSelection } from './watermarkTypes';
 
 type Props = {
   uri: string;
   width: number;
   height: number;
   matrix: number[];
-  /** 非 none 时在成片底部居中叠加透明 PNG 角标 */
-  watermarkStyle?: WatermarkStyleId;
+  /** 水印选择（插件或自定义）；none 为关闭 */
+  watermark?: WatermarkSelection;
   onExported: (fileUri: string) => void;
   onError: (e: Error) => void;
 };
@@ -34,16 +36,22 @@ export function FilmProcessor({
   width,
   height,
   matrix,
-  watermarkStyle = 'none',
+  watermark = { kind: 'none' },
   onExported,
   onError,
 }: Props) {
   const image = useImage(uri);
-  const wmSource = isImageWatermarkStyle(watermarkStyle)
-    ? getWatermarkAssetSource(watermarkStyle)
-    : null;
-  const wmImage = useImage(wmSource);
-  const wmCfg = useMemo(() => getWatermarkRenderConfig(watermarkStyle), [watermarkStyle]);
+  const wmSource =
+    watermark.kind === 'plugin' ? getWatermarkAssetSource(watermark.id) : null;
+  const wmUri = watermark.kind === 'custom' ? watermark.watermark.uri : null;
+  const wmImage = useImage(wmUri ?? wmSource);
+  const wmCfg = useMemo(() => {
+    if (watermark.kind === 'plugin') return getWatermarkRenderConfig(watermark.id);
+    if (watermark.kind === 'custom') {
+      return { opacity: watermark.watermark.opacity, scale: watermark.watermark.scale };
+    }
+    return { opacity: 0, scale: 1 };
+  }, [watermark]);
 
   const ref = useCanvasRef();
   const onExportedRef = useRef(onExported);
@@ -52,19 +60,42 @@ export function FilmProcessor({
   onErrorRef.current = onError;
 
   const matrixKey = matrix.join(',');
-  const wmKey = watermarkStyle === 'none' ? '' : watermarkStyle;
+  const wmKey =
+    watermark.kind === 'none' ? '' : watermark.kind === 'plugin' ? watermark.id : watermark.watermark.id;
 
   const wmLayout = useMemo(() => {
     if (!wmImage) return null;
     const iw = wmImage.width();
     const ih = wmImage.height();
     if (iw <= 0 || ih <= 0) return null;
+    if (watermark.kind === 'custom') {
+      if (watermark.watermark.placement) {
+        return computeWatermarkRectWithPlacement(
+          width,
+          height,
+          iw,
+          ih,
+          wmCfg.scale,
+          watermark.watermark.placement,
+        );
+      }
+      return computeWatermarkRectWithAnchor(
+        width,
+        height,
+        iw,
+        ih,
+        wmCfg.scale,
+        watermark.watermark.anchor,
+      );
+    }
+    // 插件水印：底部居中
     return computeWatermarkRect(width, height, iw, ih, wmCfg.scale);
-  }, [height, width, wmCfg.scale, wmImage]);
+  }, [height, width, watermark, wmCfg.scale, wmImage]);
 
   useEffect(() => {
     if (!image || !FileSystem.cacheDirectory) return;
-    if (isImageWatermarkStyle(watermarkStyle) && !wmImage) return;
+    if (watermark.kind === 'plugin' && isImageWatermarkStyle(watermark.id) && !wmImage) return;
+    if (watermark.kind === 'custom' && !wmImage) return;
     let cancelled = false;
 
     const run = async () => {
@@ -92,7 +123,7 @@ export function FilmProcessor({
     return () => {
       cancelled = true;
     };
-  }, [image, uri, width, height, matrixKey, watermarkStyle, wmImage, wmKey]);
+  }, [image, uri, width, height, matrixKey, watermark, wmImage, wmKey]);
 
   if (!FileSystem.cacheDirectory) return null;
 

@@ -5,6 +5,7 @@ import {
   Image,
   Linking,
   Modal,
+  PanResponder,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -24,6 +25,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
+import { PinchGestureHandler, type PinchGestureHandlerGestureEvent } from 'react-native-gesture-handler';
 
 import {
   FILM_MODE_OPTIONS,
@@ -38,11 +40,16 @@ import { getMediaLibraryAccessRequestOptions } from './mediaLibraryPermission';
 import {
   WATERMARK_OPTIONS,
   computeWatermarkRect,
+  computeWatermarkRectWithAnchor,
+  computeWatermarkRectWithPlacement,
   getWatermarkAssetSource,
   getWatermarkRenderConfig,
   isImageWatermarkStyle,
   type WatermarkStyleId,
 } from './watermarkConfig';
+import { WatermarkSettingsModal } from './WatermarkSettingsModal';
+import { loadCustomWatermarks, saveCustomWatermarks } from './customWatermarkStore';
+import type { CustomWatermark, WatermarkSelection } from './watermarkTypes';
 
 /**
  * 取景叠层与成片差异说明：
@@ -70,6 +77,11 @@ const C = {
   line: 'rgba(201,169,98,0.4)',
 };
 
+function clamp01(x: number) {
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(1, x));
+}
+
 function formatRecordingDuration(totalSec: number): string {
   const s = Math.max(0, Math.floor(totalSec));
   const m = Math.floor(s / 60);
@@ -83,7 +95,7 @@ type ExportJob = {
   height: number;
   matrix: number[];
   fallbackUri: string;
-  watermarkStyle: WatermarkStyleId;
+  watermark: WatermarkSelection;
 };
 
 function SwatchTile({
@@ -117,11 +129,13 @@ function WatermarkTile({
   selected,
   onPress,
   source,
+  uri,
 }: {
   label: string;
   selected: boolean;
   onPress: () => void;
   source: number | null;
+  uri?: string | null;
 }) {
   return (
     <Pressable onPress={onPress} style={styles.sheetTile}>
@@ -130,6 +144,13 @@ function WatermarkTile({
           {source ? (
             <Image
               source={source}
+              style={styles.watermarkThumbImage}
+              resizeMode="contain"
+              accessibilityLabel={label}
+            />
+          ) : uri ? (
+            <Image
+              source={{ uri }}
               style={styles.watermarkThumbImage}
               resizeMode="contain"
               accessibilityLabel={label}
@@ -180,11 +201,17 @@ export function RetroCameraScreen() {
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const [filmSheetOpen, setFilmSheetOpen] = useState(false);
   const [watermarkSheetOpen, setWatermarkSheetOpen] = useState(false);
-  const [watermarkStyle, setWatermarkStyle] = useState<WatermarkStyleId>('none');
+  const [watermark, setWatermark] = useState<WatermarkSelection>({ kind: 'none' });
+  type CustomWatermarkWithPx = CustomWatermark & { pixelSize?: { w: number; h: number } };
+  const [customWatermarks, setCustomWatermarks] = useState<CustomWatermarkWithPx[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [watermarkSettingsOpen, setWatermarkSettingsOpen] = useState(false);
   /** 取景卡片像素尺寸，用于与成片同一公式叠水印预览 */
   const [previewLayout, setPreviewLayout] = useState<{ w: number; h: number } | null>(null);
   const [flashMode, setFlashMode] = useState<FlashMode>('off');
   const [showGrid, setShowGrid] = useState(false);
+  const [zoom, setZoom] = useState(0);
+  const zoomBaseRef = useRef(0);
   const [galleryUri, setGalleryUri] = useState<string | null>(null);
   /** 系统相册选择后，应用内全屏预览用的本地 URI */
   const [pickedGalleryPreviewUri, setPickedGalleryPreviewUri] = useState<string | null>(null);
@@ -204,26 +231,144 @@ export function RetroCameraScreen() {
   const filter = FILTERS[filterIndex];
 
   const wmAssetPx = useMemo(() => {
-    if (!isImageWatermarkStyle(watermarkStyle)) return null;
-    const src = getWatermarkAssetSource(watermarkStyle);
-    if (src == null) return null;
-    const r = Image.resolveAssetSource(src);
-    if (r && r.width > 0 && r.height > 0) return { w: r.width, h: r.height };
-    return { w: 480, h: 100 };
-  }, [watermarkStyle]);
+    if (watermark.kind === 'plugin') {
+      if (!isImageWatermarkStyle(watermark.id)) return null;
+      const src = getWatermarkAssetSource(watermark.id);
+      if (src == null) return null;
+      const r = Image.resolveAssetSource(src);
+      if (r && r.width > 0 && r.height > 0) return { w: r.width, h: r.height };
+      return { w: 480, h: 100 };
+    }
+    return null;
+  }, [watermark]);
 
-  const wmRenderCfg = useMemo(() => getWatermarkRenderConfig(watermarkStyle), [watermarkStyle]);
+  const wmRenderCfg = useMemo(() => {
+    if (watermark.kind === 'plugin') return getWatermarkRenderConfig(watermark.id);
+    if (watermark.kind === 'custom') {
+      return { opacity: watermark.watermark.opacity, scale: watermark.watermark.scale };
+    }
+    return { opacity: 0, scale: 1 };
+  }, [watermark]);
 
   const wmPreviewRect = useMemo(() => {
-    if (!previewLayout || !wmAssetPx) return null;
-    return computeWatermarkRect(
-      previewLayout.w,
-      previewLayout.h,
-      wmAssetPx.w,
-      wmAssetPx.h,
-      wmRenderCfg.scale,
+    if (!previewLayout) return null;
+    if (watermark.kind === 'plugin') {
+      if (!wmAssetPx) return null;
+      return computeWatermarkRect(
+        previewLayout.w,
+        previewLayout.h,
+        wmAssetPx.w,
+        wmAssetPx.h,
+        wmRenderCfg.scale,
+      );
+    }
+    if (watermark.kind === 'custom') {
+      const px = customWatermarks.find((x) => x.id === watermark.watermark.id);
+      const w = px?.pixelSize?.w;
+      const h = px?.pixelSize?.h;
+      if (!Number.isFinite(w) || !Number.isFinite(h)) return null;
+      if (watermark.watermark.placement) {
+        return computeWatermarkRectWithPlacement(
+          previewLayout.w,
+          previewLayout.h,
+          w as number,
+          h as number,
+          wmRenderCfg.scale,
+          watermark.watermark.placement,
+        );
+      }
+      return computeWatermarkRectWithAnchor(
+        previewLayout.w,
+        previewLayout.h,
+        w as number,
+        h as number,
+        wmRenderCfg.scale,
+        watermark.watermark.anchor,
+      );
+    }
+    return null;
+  }, [previewLayout, watermark, wmAssetPx, wmRenderCfg.scale, customWatermarks]);
+
+  const persistCustomWatermarks = useCallback(async (next: CustomWatermarkWithPx[]) => {
+    setCustomWatermarks(next);
+    await saveCustomWatermarks(
+      next.map(({ pixelSize, ...rest }) => rest),
     );
-  }, [previewLayout, wmAssetPx, wmRenderCfg.scale]);
+  }, []);
+
+  const updateCustomWatermark = useCallback(
+    async (id: string, patch: Partial<CustomWatermark>) => {
+      const next = customWatermarks.map((it) => (it.id === id ? ({ ...it, ...patch } as CustomWatermarkWithPx) : it));
+      await persistCustomWatermarks(next);
+      if (watermark.kind === 'custom' && watermark.watermark.id === id) {
+        const latest = next.find((x) => x.id === id);
+        if (latest) setWatermark({ kind: 'custom', watermark: latest });
+      }
+    },
+    [customWatermarks, persistCustomWatermarks, watermark],
+  );
+
+  // 加载自定义水印列表（用于相机水印选择面板）
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const list = await loadCustomWatermarks();
+      if (!alive) return;
+      if (list.length > 0) setCustomWatermarks(list);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // 从“水印设置”返回时刷新列表，保证删除/修改即时生效
+  const wmSettingsPrevOpenRef = useRef<boolean>(false);
+  useEffect(() => {
+    const prev = wmSettingsPrevOpenRef.current;
+    wmSettingsPrevOpenRef.current = watermarkSettingsOpen;
+    // 仅在从 open -> close 时刷新，避免测试环境初次渲染产生 act 警告
+    if (!(prev === true && watermarkSettingsOpen === false)) return;
+    let alive = true;
+    void (async () => {
+      const list = await loadCustomWatermarks();
+      if (!alive) return;
+      setCustomWatermarks(list);
+      // 当前选中的自定义水印若已被删除，则回退到关闭
+      if (watermark.kind === 'custom' && !list.some((x) => x.id === watermark.watermark.id)) {
+        setWatermark({ kind: 'none' });
+      } else if (watermark.kind === 'custom') {
+        const latest = list.find((x) => x.id === watermark.watermark.id);
+        if (latest) setWatermark({ kind: 'custom', watermark: latest });
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [watermarkSettingsOpen, watermark]);
+
+  // 为自定义水印获取像素尺寸（用于预览叠加计算）
+  useEffect(() => {
+    const pending = customWatermarks.filter((x) => x.pixelSize == null);
+    if (pending.length === 0) return;
+    let cancelled = false;
+    pending.forEach((wm) => {
+      Image.getSize(
+        wm.uri,
+        (w, h) => {
+          if (cancelled) return;
+          setCustomWatermarks((prev) =>
+            prev.map((it) => (it.id === wm.id ? ({ ...it, pixelSize: { w, h } } as CustomWatermarkWithPx) : it)),
+          );
+        },
+        () => {
+          /* ignore */
+        },
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [customWatermarks]);
 
   const filterSwatch = (f: FilmFilter): [string, string] =>
     f.swatch ?? ['#3d3d46', '#1a1a1f'];
@@ -290,6 +435,60 @@ export function RetroCameraScreen() {
   const cycleFlash = useCallback(() => {
     setFlashMode((f) => (f === 'off' ? 'on' : 'off'));
   }, []);
+
+  const onPinchGestureEvent = useCallback((ev: PinchGestureHandlerGestureEvent) => {
+    const s = ev.nativeEvent.scale;
+    if (!Number.isFinite(s) || s <= 0) return;
+    // pinch scale -> zoom（归一化 0~1）
+    const next = clamp01(zoomBaseRef.current + Math.log2(s) * 0.35);
+    setZoom(next);
+  }, []);
+
+  const onPinchStateChange = useCallback(
+    (ev: PinchGestureHandlerGestureEvent) => {
+      const st = ev.nativeEvent.state;
+      // 5=END, 3=CANCELLED, 4=FAILED
+      if (st === 5 || st === 3 || st === 4) {
+        zoomBaseRef.current = zoom;
+      }
+    },
+    [zoom],
+  );
+
+  const wmDragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const wmPanResponder = useMemo(() => {
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () =>
+        watermark.kind === 'custom' && watermark.watermark.placement != null,
+      onMoveShouldSetPanResponder: () =>
+        watermark.kind === 'custom' && watermark.watermark.placement != null,
+      onPanResponderGrant: () => {
+        if (watermark.kind !== 'custom' || !watermark.watermark.placement) return;
+        wmDragStartRef.current = { ...watermark.watermark.placement };
+      },
+      onPanResponderMove: (_, g) => {
+        if (watermark.kind !== 'custom' || !watermark.watermark.placement) return;
+        if (!previewLayout || !wmPreviewRect) return;
+        const start = wmDragStartRef.current ?? watermark.watermark.placement;
+        const denomX = Math.max(1, previewLayout.w - wmPreviewRect.w);
+        const denomY = Math.max(1, previewLayout.h - wmPreviewRect.h);
+        const dx = g.dx / denomX;
+        const dy = g.dy / denomY;
+        const next = {
+          x: Math.max(0, Math.min(1, start.x + dx)),
+          y: Math.max(0, Math.min(1, start.y + dy)),
+        };
+        // 即时更新（含持久化），让手感接近系统相机拖拽
+        void updateCustomWatermark(watermark.watermark.id, { placement: next });
+      },
+      onPanResponderRelease: () => {
+        wmDragStartRef.current = null;
+      },
+      onPanResponderTerminate: () => {
+        wmDragStartRef.current = null;
+      },
+    });
+  }, [previewLayout, updateCustomWatermark, watermark, wmPreviewRect]);
 
   const closePickedGalleryPreview = useCallback(() => {
     setPickedGalleryPreviewUri(null);
@@ -430,7 +629,7 @@ export function RetroCameraScreen() {
         height: sized.height,
         matrix,
         fallbackUri: raw.uri,
-        watermarkStyle,
+        watermark,
       });
     } catch (e) {
       Alert.alert('拍照失败', e instanceof Error ? e.message : String(e));
@@ -443,7 +642,7 @@ export function RetroCameraScreen() {
     requestCameraPermission,
     resizeForPipeline,
     scheduleExportJob,
-    watermarkStyle,
+    watermark,
   ]);
 
   const toggleRecord = useCallback(async () => {
@@ -516,8 +715,8 @@ export function RetroCameraScreen() {
     setFilmSheetOpen(false);
   }, []);
 
-  const selectWatermarkStyle = useCallback((id: WatermarkStyleId) => {
-    setWatermarkStyle(id);
+  const selectWatermark = useCallback((sel: WatermarkSelection) => {
+    setWatermark(sel);
     setWatermarkSheetOpen(false);
   }, []);
 
@@ -556,19 +755,38 @@ export function RetroCameraScreen() {
   const renderWatermarkSheet = () => (
     <>
       <Text style={styles.sheetSectionTitle}>水印</Text>
-      <Text style={styles.sheetHint}>选择水印（放入 plugins 目录后会自动出现在列表）</Text>
+      <Text style={styles.sheetHint}>插件水印 + 自定义水印（在右上角设置里上传/编辑）</Text>
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.sheetScroll}
       >
-        {WATERMARK_OPTIONS.map((opt) => (
+        {WATERMARK_OPTIONS.map((opt) => {
+          const selected = watermark.kind === 'none'
+            ? opt.id === 'none'
+            : watermark.kind === 'plugin'
+              ? watermark.id === opt.id
+              : false;
+          return (
+            <WatermarkTile
+              key={opt.id}
+              label={opt.label}
+              selected={selected}
+              source={getWatermarkAssetSource(opt.id)}
+              onPress={() =>
+                selectWatermark(opt.id === 'none' ? { kind: 'none' } : { kind: 'plugin', id: opt.id as string })
+              }
+            />
+          );
+        })}
+        {customWatermarks.map((wm) => (
           <WatermarkTile
-            key={opt.id}
-            label={opt.label}
-            selected={watermarkStyle === opt.id}
-            source={getWatermarkAssetSource(opt.id)}
-            onPress={() => selectWatermarkStyle(opt.id)}
+            key={wm.id}
+            label={wm.name}
+            selected={watermark.kind === 'custom' && watermark.watermark.id === wm.id}
+            source={null}
+            uri={wm.uri}
+            onPress={() => selectWatermark({ kind: 'custom', watermark: wm })}
           />
         ))}
       </ScrollView>
@@ -605,12 +823,12 @@ export function RetroCameraScreen() {
 
       {activeExportJob ? (
         <FilmProcessor
-          key={`${activeExportJob.uri}-${activeExportJob.matrix.join(',')}-${activeExportJob.watermarkStyle}`}
+          key={`${activeExportJob.uri}-${activeExportJob.matrix.join(',')}-${activeExportJob.watermark.kind === 'none' ? 'none' : activeExportJob.watermark.kind === 'plugin' ? activeExportJob.watermark.id : activeExportJob.watermark.watermark.id}`}
           uri={activeExportJob.uri}
           width={activeExportJob.width}
           height={activeExportJob.height}
           matrix={activeExportJob.matrix}
-          watermarkStyle={activeExportJob.watermarkStyle}
+          watermark={activeExportJob.watermark}
           onExported={onFilmExported}
           onError={(err) => {
             void onFilmError(err, activeExportJob.fallbackUri);
@@ -712,32 +930,73 @@ export function RetroCameraScreen() {
           <Pressable
             style={styles.retroGearBtn}
             accessibilityLabel="设置"
-            onPress={() => Alert.alert('设置', '更多选项将在后续版本开放。')}
+            onPress={() => setSettingsOpen(true)}
           >
             <Text style={styles.retroGearIcon}>⚙</Text>
           </Pressable>
         </View>
       </View>
 
+      <Modal
+        visible={settingsOpen}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setSettingsOpen(false)}
+      >
+        <View style={styles.modalRoot}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setSettingsOpen(false)} />
+          <View style={[styles.sheetPanel, { maxHeight: '40%' }]}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetSectionTitle}>设置</Text>
+            <Pressable
+              testID="open-watermark-settings"
+              style={styles.settingsRow}
+              onPress={() => {
+                setSettingsOpen(false);
+                setWatermarkSettingsOpen(true);
+              }}
+            >
+              <Text style={styles.settingsRowTitle}>水印设置</Text>
+              <Text style={styles.settingsRowChevron}>›</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <WatermarkSettingsModal
+        visible={watermarkSettingsOpen}
+        onRequestClose={() => setWatermarkSettingsOpen(false)}
+        onPickWatermark={(wm) => {
+          setCustomWatermarks((prev) => {
+            const has = prev.some((x) => x.id === wm.id);
+            return has ? prev : [wm, ...prev];
+          });
+          setWatermark({ kind: 'custom', watermark: wm });
+          setWatermarkSettingsOpen(false);
+        }}
+      />
+
       {permBanner}
 
       <View style={styles.previewFlex}>
-        <View
-          style={styles.previewCard}
-          collapsable={false}
-          onLayout={(e) => {
-            const { width, height } = e.nativeEvent.layout;
-            setPreviewLayout((prev) =>
-              prev && prev.w === width && prev.h === height ? prev : { w: width, h: height },
-            );
-          }}
-        >
+        <PinchGestureHandler onGestureEvent={onPinchGestureEvent} onHandlerStateChange={onPinchStateChange}>
+          <View
+            style={styles.previewCard}
+            collapsable={false}
+            onLayout={(e) => {
+              const { width, height } = e.nativeEvent.layout;
+              setPreviewLayout((prev) =>
+                prev && prev.w === width && prev.h === height ? prev : { w: width, h: height },
+              );
+            }}
+          >
           {cameraPermission?.granted ? (
             <CameraView
               ref={camRef}
               style={StyleSheet.absoluteFill}
               facing={facing}
               mode={mode}
+              zoom={zoom}
               flash={
                 mode === 'picture' && facing === 'back' ? flashMode : 'off'
               }
@@ -813,24 +1072,44 @@ export function RetroCameraScreen() {
               {preset.label} · {filter.label}
             </Text>
           </View>
-          {wmPreviewRect && isImageWatermarkStyle(watermarkStyle) ? (
-            <View style={StyleSheet.absoluteFill} pointerEvents="none">
-              <Image
-                source={getWatermarkAssetSource(watermarkStyle)!}
+          {wmPreviewRect && watermark.kind !== 'none' ? (
+            <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+              <View
                 style={[
-                  styles.watermarkPreviewImage,
+                  styles.watermarkDragHitbox,
                   {
                     left: wmPreviewRect.x,
                     top: wmPreviewRect.y,
                     width: wmPreviewRect.w,
                     height: wmPreviewRect.h,
-                    opacity: wmRenderCfg.opacity,
                   },
                 ]}
-                resizeMode="stretch"
-                accessibilityElementsHidden
-                importantForAccessibility="no-hide-descendants"
-              />
+                pointerEvents={
+                  watermark.kind === 'custom' && watermark.watermark.placement ? 'auto' : 'none'
+                }
+                {...(watermark.kind === 'custom' && watermark.watermark.placement
+                  ? wmPanResponder.panHandlers
+                  : {})}
+              >
+                <Image
+                  source={
+                    watermark.kind === 'plugin'
+                      ? getWatermarkAssetSource(watermark.id)!
+                      : { uri: watermark.watermark.uri }
+                  }
+                  style={[
+                    styles.watermarkPreviewImage,
+                    {
+                      width: wmPreviewRect.w,
+                      height: wmPreviewRect.h,
+                      opacity: wmRenderCfg.opacity,
+                    },
+                  ]}
+                  resizeMode="stretch"
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                />
+              </View>
             </View>
           ) : null}
           {!cameraReady && cameraPermission?.granted ? (
@@ -839,7 +1118,8 @@ export function RetroCameraScreen() {
               <Text style={styles.busyTxt}>正在启动相机…</Text>
             </View>
           ) : null}
-        </View>
+          </View>
+        </PinchGestureHandler>
       </View>
 
       <View style={styles.modeRow}>
@@ -896,7 +1176,7 @@ export function RetroCameraScreen() {
             setFilterSheetOpen(false);
             setWatermarkSheetOpen(true);
           }}
-          accessibilityLabel={`水印，当前 ${WATERMARK_OPTIONS.find((o) => o.id === watermarkStyle)?.label ?? ''}`}
+          accessibilityLabel={`水印`}
         >
           <View
             style={[styles.featureCircle, watermarkSheetOpen && styles.featureCircleActive]}
@@ -904,7 +1184,7 @@ export function RetroCameraScreen() {
             <Ionicons
               name="water-outline"
               size={22}
-              color={watermarkStyle === 'none' ? C.goldMuted : C.gold}
+              color={watermark.kind === 'none' ? C.goldMuted : C.gold}
             />
           </View>
         </Pressable>
@@ -1010,6 +1290,18 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     maxHeight: '48%',
   },
+  settingsRow: {
+    marginTop: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: 'rgba(0,0,0,0.04)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  settingsRowTitle: { fontSize: 15, fontWeight: '800', color: '#2a2824' },
+  settingsRowChevron: { fontSize: 18, fontWeight: '900', color: '#5c5850' },
   sheetHandle: {
     alignSelf: 'center',
     width: 40,
@@ -1362,6 +1654,10 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   watermarkPreviewImage: {
+    width: '100%',
+    height: '100%',
+  },
+  watermarkDragHitbox: {
     position: 'absolute',
   },
   busyWrap: {

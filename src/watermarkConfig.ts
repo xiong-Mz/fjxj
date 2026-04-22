@@ -30,10 +30,12 @@ export function computeWatermarkRect(
   assetPixelWidth: number,
   assetPixelHeight: number,
   scale = 1,
+  maxScale = 3,
 ): { x: number; y: number; w: number; h: number } {
   const edge = Math.min(containerWidth, containerHeight);
   const margin = Math.max(WATERMARK_LAYOUT.minMarginPx, edge * WATERMARK_LAYOUT.marginFromMinEdge);
-  const safeScale = Number.isFinite(scale) ? Math.max(0.1, Math.min(3, scale)) : 1;
+  const safeMaxScale = Number.isFinite(maxScale) ? Math.max(0.1, maxScale) : 3;
+  const safeScale = Number.isFinite(scale) ? Math.max(0.1, Math.min(safeMaxScale, scale)) : 1;
   const maxW = containerWidth * WATERMARK_LAYOUT.maxWidthFraction * safeScale;
   const maxH = edge * WATERMARK_LAYOUT.maxHeightFractionOfMinEdge * safeScale;
   const iw = Math.max(1, assetPixelWidth);
@@ -47,6 +49,102 @@ export function computeWatermarkRect(
   const x = (containerWidth - w) / 2;
   const y = containerHeight - margin - h;
   return { x, y, w, h };
+}
+
+/** 自定义水印：在 computeWatermarkRect 的“尺寸规则”基础上，支持固定锚点位置 */
+export function computeWatermarkRectWithAnchor(
+  containerWidth: number,
+  containerHeight: number,
+  assetPixelWidth: number,
+  assetPixelHeight: number,
+  scale: number,
+  anchor:
+    | 'top_left'
+    | 'top_center'
+    | 'top_right'
+    | 'bottom_left'
+    | 'bottom_center'
+    | 'bottom_right',
+): { x: number; y: number; w: number; h: number } {
+  // 自定义水印允许更大倍率（比如 100）
+  const base = computeWatermarkRect(
+    containerWidth,
+    containerHeight,
+    assetPixelWidth,
+    assetPixelHeight,
+    scale,
+    100,
+  );
+  const edge = Math.min(containerWidth, containerHeight);
+  const margin = Math.max(WATERMARK_LAYOUT.minMarginPx, edge * WATERMARK_LAYOUT.marginFromMinEdge);
+
+  const xLeft = margin;
+  const xCenter = (containerWidth - base.w) / 2;
+  const xRight = containerWidth - margin - base.w;
+
+  const yTop = margin;
+  const yBottom = containerHeight - margin - base.h;
+
+  let x = xCenter;
+  let y = yBottom;
+  switch (anchor) {
+    case 'top_left':
+      x = xLeft;
+      y = yTop;
+      break;
+    case 'top_center':
+      x = xCenter;
+      y = yTop;
+      break;
+    case 'top_right':
+      x = xRight;
+      y = yTop;
+      break;
+    case 'bottom_left':
+      x = xLeft;
+      y = yBottom;
+      break;
+    case 'bottom_center':
+      x = xCenter;
+      y = yBottom;
+      break;
+    case 'bottom_right':
+      x = xRight;
+      y = yBottom;
+      break;
+  }
+  return {
+    x: Math.max(0, Math.min(containerWidth - base.w, x)),
+    y: Math.max(0, Math.min(containerHeight - base.h, y)),
+    w: base.w,
+    h: base.h,
+  };
+}
+
+/** 自定义水印自由位置：在 computeWatermarkRect 的尺寸规则基础上，允许在画布内任意摆放 */
+export function computeWatermarkRectWithPlacement(
+  containerWidth: number,
+  containerHeight: number,
+  assetPixelWidth: number,
+  assetPixelHeight: number,
+  scale: number,
+  placement: { x: number; y: number },
+): { x: number; y: number; w: number; h: number } {
+  const base = computeWatermarkRect(
+    containerWidth,
+    containerHeight,
+    assetPixelWidth,
+    assetPixelHeight,
+    scale,
+    100,
+  );
+  const safeX = Number.isFinite(placement.x) ? Math.max(0, Math.min(1, placement.x)) : 0.5;
+  const safeY = Number.isFinite(placement.y) ? Math.max(0, Math.min(1, placement.y)) : 0.85;
+  const px = safeX * (containerWidth - base.w);
+  const py = safeY * (containerHeight - base.h);
+  const x = Math.max(0, Math.min(containerWidth - base.w, px));
+  const y = Math.max(0, Math.min(containerHeight - base.h, py));
+  return { x, y, w: base.w, h: base.h };
 }
 
 export function getWatermarkRenderConfig(id: WatermarkStyleId): WatermarkRenderConfig {
