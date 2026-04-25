@@ -3,9 +3,27 @@
 jest.mock('react-native-reanimated', () => require('react-native-reanimated/mock'));
 
 jest.mock('react-native-gesture-handler', () => {
+  const React = require('react');
   const { View } = require('react-native');
+
+  const noopGesture = () => {
+    const g = {
+      onBegin: () => g,
+      onUpdate: () => g,
+      onEnd: () => g,
+      onFinalize: () => g,
+      minDistance: () => g,
+    };
+    return g;
+  };
+
   return {
     GestureHandlerRootView: View,
+    GestureDetector: ({ children, ...props }) => React.createElement(View, props, children),
+    Gesture: {
+      Pinch: noopGesture,
+      Pan: noopGesture,
+    },
     TapGestureHandler: View,
     PanGestureHandler: View,
     PinchGestureHandler: View,

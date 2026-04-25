@@ -33,7 +33,7 @@ export type CustomWatermark = {
 
 export type WatermarkSelection =
   | { kind: 'none' }
-  | { kind: 'plugin'; id: string }
+  | { kind: 'plugin'; id: string; placement?: WatermarkPlacement }
   | { kind: 'custom'; watermark: CustomWatermark };
 
 export function getWatermarkKey(sel: WatermarkSelection): string {

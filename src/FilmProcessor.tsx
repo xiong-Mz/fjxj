@@ -88,8 +88,21 @@ export function FilmProcessor({
         watermark.watermark.anchor,
       );
     }
-    // 插件水印：底部居中
-    return computeWatermarkRect(width, height, iw, ih, wmCfg.scale);
+    if (watermark.kind === 'plugin') {
+      // 插件水印：默认底部居中；若用户拖拽过则使用 placement
+      if (watermark.placement) {
+        return computeWatermarkRectWithPlacement(
+          width,
+          height,
+          iw,
+          ih,
+          wmCfg.scale,
+          watermark.placement,
+        );
+      }
+      return computeWatermarkRect(width, height, iw, ih, wmCfg.scale);
+    }
+    return null;
   }, [height, width, watermark, wmCfg.scale, wmImage]);
 
   useEffect(() => {

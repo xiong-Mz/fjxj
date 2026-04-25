@@ -25,7 +25,13 @@ import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
-import { PinchGestureHandler, type PinchGestureHandlerGestureEvent } from 'react-native-gesture-handler';
+import {
+  Gesture,
+  GestureDetector,
+  type GestureUpdateEvent,
+  type PinchGestureHandlerEventPayload,
+} from 'react-native-gesture-handler';
+import Animated, { useAnimatedProps, useSharedValue } from 'react-native-reanimated';
 
 import {
   FILM_MODE_OPTIONS,
@@ -49,7 +55,12 @@ import {
 } from './watermarkConfig';
 import { WatermarkSettingsModal } from './WatermarkSettingsModal';
 import { loadCustomWatermarks, saveCustomWatermarks } from './customWatermarkStore';
-import type { CustomWatermark, WatermarkSelection } from './watermarkTypes';
+import type { CustomWatermark, WatermarkPlacement, WatermarkSelection } from './watermarkTypes';
+
+const AnimatedCameraView = Animated.createAnimatedComponent(CameraView);
+
+/** 连点「RETRO FILM」标题三次切换（仅 __DEV__） */
+const WM_DEBUG_TAP_RESET_MS = 600;
 
 /**
  * 取景叠层与成片差异说明：
@@ -189,6 +200,7 @@ function GridGlyph({ active }: { active: boolean }) {
 export function RetroCameraScreen() {
   const camRef = useRef<InstanceType<typeof CameraView> | null>(null);
   const insets = useSafeAreaInsets();
+  const watermarkRef = useRef<WatermarkSelection>({ kind: 'none' });
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
@@ -210,11 +222,23 @@ export function RetroCameraScreen() {
   const [previewLayout, setPreviewLayout] = useState<{ w: number; h: number } | null>(null);
   const [flashMode, setFlashMode] = useState<FlashMode>('off');
   const [showGrid, setShowGrid] = useState(false);
-  const [zoom, setZoom] = useState(0);
-  const zoomBaseRef = useRef(0);
+  // 缩放：用 Reanimated shared value，手势在 UI 线程更新，避免 JS 卡顿
+  const zoomSV = useSharedValue(0);
+  const zoomStartSV = useSharedValue(0);
   const [galleryUri, setGalleryUri] = useState<string | null>(null);
   /** 系统相册选择后，应用内全屏预览用的本地 URI */
   const [pickedGalleryPreviewUri, setPickedGalleryPreviewUri] = useState<string | null>(null);
+  /** 水印拖拽中的像素偏移（仅预览；松手后写入 placement） */
+  const [wmDragPx, setWmDragPx] = useState<{ x: number; y: number } | null>(null);
+  /** __DEV__：连点品牌行三次打开，用于排查手势/状态卡死 */
+  const [watermarkDebugPanel, setWatermarkDebugPanel] = useState(false);
+  const wmDebugTapRef = useRef<{ count: number; at: number }>({ count: 0, at: 0 });
+  const wmPanGrantRef = useRef({ sx: 0, sy: 0 });
+  const wmDragPxRef = useRef<{ x: number; y: number } | null>(null);
+  wmDragPxRef.current = wmDragPx;
+
+  /** 避免 Image.getSize 与 effect cleanup 竞态导致尺寸丢失，或重复请求卡死主线程 */
+  const wmPixelSizeInflightRef = useRef(new Set<string>());
 
   const [activeExportJob, setActiveExportJob] = useState<ExportJob | null>(null);
   const exportQueueRef = useRef<ExportJob[]>([]);
@@ -229,6 +253,10 @@ export function RetroCameraScreen() {
 
   const preset = FILM_MODE_OPTIONS[filmModeIndex];
   const filter = FILTERS[filterIndex];
+
+  useEffect(() => {
+    watermarkRef.current = watermark;
+  }, [watermark]);
 
   const wmAssetPx = useMemo(() => {
     if (watermark.kind === 'plugin') {
@@ -254,6 +282,16 @@ export function RetroCameraScreen() {
     if (!previewLayout) return null;
     if (watermark.kind === 'plugin') {
       if (!wmAssetPx) return null;
+      if (watermark.placement) {
+        return computeWatermarkRectWithPlacement(
+          previewLayout.w,
+          previewLayout.h,
+          wmAssetPx.w,
+          wmAssetPx.h,
+          wmRenderCfg.scale,
+          watermark.placement,
+        );
+      }
       return computeWatermarkRect(
         previewLayout.w,
         previewLayout.h,
@@ -288,6 +326,16 @@ export function RetroCameraScreen() {
     }
     return null;
   }, [previewLayout, watermark, wmAssetPx, wmRenderCfg.scale, customWatermarks]);
+
+  useEffect(() => {
+    setWmDragPx(null);
+  }, [watermark, wmPreviewRect?.x, wmPreviewRect?.y, wmPreviewRect?.w, wmPreviewRect?.h]);
+
+  const displayWmRect = useMemo(() => {
+    if (!wmPreviewRect) return null;
+    if (!wmDragPx) return wmPreviewRect;
+    return { ...wmPreviewRect, x: wmDragPx.x, y: wmDragPx.y };
+  }, [wmPreviewRect, wmDragPx]);
 
   const persistCustomWatermarks = useCallback(async (next: CustomWatermarkWithPx[]) => {
     setCustomWatermarks(next);
@@ -348,26 +396,29 @@ export function RetroCameraScreen() {
 
   // 为自定义水印获取像素尺寸（用于预览叠加计算）
   useEffect(() => {
-    const pending = customWatermarks.filter((x) => x.pixelSize == null);
-    if (pending.length === 0) return;
-    let cancelled = false;
-    pending.forEach((wm) => {
+    customWatermarks.forEach((wm) => {
+      if (wm.pixelSize != null) {
+        wmPixelSizeInflightRef.current.delete(wm.id);
+        return;
+      }
+      if (wmPixelSizeInflightRef.current.has(wm.id)) return;
+      wmPixelSizeInflightRef.current.add(wm.id);
       Image.getSize(
         wm.uri,
         (w, h) => {
-          if (cancelled) return;
-          setCustomWatermarks((prev) =>
-            prev.map((it) => (it.id === wm.id ? ({ ...it, pixelSize: { w, h } } as CustomWatermarkWithPx) : it)),
-          );
+          setCustomWatermarks((prev) => {
+            const cur = prev.find((it) => it.id === wm.id);
+            if (!cur || cur.pixelSize != null) return prev;
+            return prev.map((it) =>
+              it.id === wm.id ? ({ ...it, pixelSize: { w, h } } as CustomWatermarkWithPx) : it,
+            );
+          });
         },
         () => {
-          /* ignore */
+          wmPixelSizeInflightRef.current.delete(wm.id);
         },
       );
     });
-    return () => {
-      cancelled = true;
-    };
   }, [customWatermarks]);
 
   const filterSwatch = (f: FilmFilter): [string, string] =>
@@ -436,59 +487,96 @@ export function RetroCameraScreen() {
     setFlashMode((f) => (f === 'off' ? 'on' : 'off'));
   }, []);
 
-  const onPinchGestureEvent = useCallback((ev: PinchGestureHandlerGestureEvent) => {
-    const s = ev.nativeEvent.scale;
-    if (!Number.isFinite(s) || s <= 0) return;
-    // pinch scale -> zoom（归一化 0~1）
-    const next = clamp01(zoomBaseRef.current + Math.log2(s) * 0.35);
-    setZoom(next);
+  const pinchGesture = useMemo(() => {
+    return Gesture.Pinch()
+      .onBegin(() => {
+        zoomStartSV.value = zoomSV.value;
+      })
+      .onUpdate((ev: GestureUpdateEvent<PinchGestureHandlerEventPayload>) => {
+        // 更“快”的映射：scale-1 的线性增量，手感更像系统相机
+        const s = ev.scale;
+        const next = Math.max(0, Math.min(1, zoomStartSV.value + (s - 1) * 0.55));
+        zoomSV.value = next;
+      });
+  }, [zoomSV, zoomStartSV]);
+
+  const cameraAnimatedProps = useAnimatedProps(() => {
+    return {
+      zoom: zoomSV.value,
+    } as any;
   }, []);
 
-  const onPinchStateChange = useCallback(
-    (ev: PinchGestureHandlerGestureEvent) => {
-      const st = ev.nativeEvent.state;
-      // 5=END, 3=CANCELLED, 4=FAILED
-      if (st === 5 || st === 3 || st === 4) {
-        zoomBaseRef.current = zoom;
+  const commitWatermarkPlacementIfNeeded = useCallback(
+    (p: WatermarkPlacement, movedPx: number) => {
+      if (movedPx < 2) return;
+      const cur = watermarkRef.current;
+      if (cur.kind === 'plugin') {
+        setWatermark({ kind: 'plugin', id: cur.id, placement: p });
+        return;
+      }
+      if (cur.kind === 'custom') {
+        setWatermark({ kind: 'custom', watermark: { ...cur.watermark, placement: p } });
+        void updateCustomWatermark(cur.watermark.id, { placement: p });
       }
     },
-    [zoom],
+    [updateCustomWatermark],
   );
 
-  const wmDragStartRef = useRef<{ x: number; y: number } | null>(null);
-  const wmPanResponder = useMemo(() => {
+  /**
+   * 水印拖拽使用 RN PanResponder，避免与 Reanimated + GestureDetector（相机 pinch）在原生层
+   * 争用导致整页触摸失效（选水印后底部按钮全灭）。
+   */
+  const wmPanHandlers = useMemo(() => {
+    if (!wmPreviewRect || !previewLayout || watermark.kind === 'none') return {};
+    const rect = wmPreviewRect;
+    const maxX = Math.max(1, previewLayout.w - rect.w);
+    const maxY = Math.max(1, previewLayout.h - rect.h);
     return PanResponder.create({
-      onStartShouldSetPanResponder: () =>
-        watermark.kind === 'custom' && watermark.watermark.placement != null,
-      onMoveShouldSetPanResponder: () =>
-        watermark.kind === 'custom' && watermark.watermark.placement != null,
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 8 || Math.abs(g.dy) > 8,
       onPanResponderGrant: () => {
-        if (watermark.kind !== 'custom' || !watermark.watermark.placement) return;
-        wmDragStartRef.current = { ...watermark.watermark.placement };
+        const cur = wmDragPxRef.current;
+        wmPanGrantRef.current = {
+          sx: cur?.x ?? rect.x,
+          sy: cur?.y ?? rect.y,
+        };
       },
       onPanResponderMove: (_, g) => {
-        if (watermark.kind !== 'custom' || !watermark.watermark.placement) return;
-        if (!previewLayout || !wmPreviewRect) return;
-        const start = wmDragStartRef.current ?? watermark.watermark.placement;
-        const denomX = Math.max(1, previewLayout.w - wmPreviewRect.w);
-        const denomY = Math.max(1, previewLayout.h - wmPreviewRect.h);
-        const dx = g.dx / denomX;
-        const dy = g.dy / denomY;
-        const next = {
-          x: Math.max(0, Math.min(1, start.x + dx)),
-          y: Math.max(0, Math.min(1, start.y + dy)),
-        };
-        // 即时更新（含持久化），让手感接近系统相机拖拽
-        void updateCustomWatermark(watermark.watermark.id, { placement: next });
+        const { sx, sy } = wmPanGrantRef.current;
+        const nx = Math.max(0, Math.min(maxX, sx + g.dx));
+        const ny = Math.max(0, Math.min(maxY, sy + g.dy));
+        setWmDragPx({ x: nx, y: ny });
       },
-      onPanResponderRelease: () => {
-        wmDragStartRef.current = null;
+      onPanResponderRelease: (_, g) => {
+        const { sx, sy } = wmPanGrantRef.current;
+        const nx = Math.max(0, Math.min(maxX, sx + g.dx));
+        const ny = Math.max(0, Math.min(maxY, sy + g.dy));
+        const moved = Math.hypot(g.dx, g.dy);
+        setWmDragPx(null);
+        if (moved < 2) return;
+        commitWatermarkPlacementIfNeeded(
+          { x: maxX > 0 ? nx / maxX : 0.5, y: maxY > 0 ? ny / maxY : 0.85 },
+          moved,
+        );
       },
       onPanResponderTerminate: () => {
-        wmDragStartRef.current = null;
+        setWmDragPx(null);
       },
-    });
-  }, [previewLayout, updateCustomWatermark, watermark, wmPreviewRect]);
+    }).panHandlers;
+  }, [wmPreviewRect, previewLayout, watermark.kind, commitWatermarkPlacementIfNeeded]);
+
+  const onWatermarkDebugBrandPress = useCallback(() => {
+    if (!__DEV__) return;
+    const now = Date.now();
+    const t = wmDebugTapRef.current;
+    if (now - t.at > WM_DEBUG_TAP_RESET_MS) t.count = 0;
+    t.count += 1;
+    t.at = now;
+    if (t.count >= 3) {
+      t.count = 0;
+      setWatermarkDebugPanel((v) => !v);
+    }
+  }, []);
 
   const closePickedGalleryPreview = useCallback(() => {
     setPickedGalleryPreviewUri(null);
@@ -774,7 +862,7 @@ export function RetroCameraScreen() {
               selected={selected}
               source={getWatermarkAssetSource(opt.id)}
               onPress={() =>
-                selectWatermark(opt.id === 'none' ? { kind: 'none' } : { kind: 'plugin', id: opt.id as string })
+                selectWatermark(opt.id === 'none' ? { kind: 'none' } : { kind: 'plugin', id: opt.id as string, placement: undefined })
               }
             />
           );
@@ -922,10 +1010,14 @@ export function RetroCameraScreen() {
       </Modal>
 
       <View style={styles.retroHeader}>
-        <View style={styles.retroBrandBlock}>
+        <Pressable
+          style={styles.retroBrandBlock}
+          onPress={onWatermarkDebugBrandPress}
+          accessibilityLabel={__DEV__ ? '品牌（开发模式连点三次开水印调试）' : '品牌'}
+        >
           <Text style={styles.retroBrandLine}>RETRO FILM</Text>
           <Text style={styles.retroBrandLineSmall}>CAMERA</Text>
-        </View>
+        </Pressable>
         <View style={styles.retroHeaderRight}>
           <Pressable
             style={styles.retroGearBtn}
@@ -978,37 +1070,63 @@ export function RetroCameraScreen() {
 
       {permBanner}
 
+      {__DEV__ && watermarkDebugPanel ? (
+        <View style={styles.wmDebugPanel} pointerEvents="box-none">
+          <Text style={styles.wmDebugTitle}>水印调试（连点 RETRO FILM 三次关闭）</Text>
+          <Text style={styles.wmDebugLine} numberOfLines={3}>
+            watermark:{' '}
+            {watermark.kind === 'none'
+              ? 'none'
+              : watermark.kind === 'plugin'
+                ? `plugin ${watermark.id}`
+                : `custom ${watermark.watermark.id}`}
+          </Text>
+          <Text style={styles.wmDebugLine}>
+            sheets film={String(filmSheetOpen)} filter={String(filterSheetOpen)} wm=
+            {String(watermarkSheetOpen)} settingsWm={String(watermarkSettingsOpen)}
+          </Text>
+          <Text style={styles.wmDebugLine}>cameraReady={String(cameraReady)}</Text>
+          <Text style={styles.wmDebugLine} numberOfLines={2}>
+            displayWmRect: {displayWmRect ? JSON.stringify(displayWmRect) : 'null'}
+          </Text>
+          <Text style={styles.wmDebugLine}>
+            previewLayout: {previewLayout ? `${previewLayout.w}x${previewLayout.h}` : 'null'}
+          </Text>
+        </View>
+      ) : null}
+
       <View style={styles.previewFlex}>
-        <PinchGestureHandler onGestureEvent={onPinchGestureEvent} onHandlerStateChange={onPinchStateChange}>
-          <View
-            style={styles.previewCard}
-            collapsable={false}
-            onLayout={(e) => {
-              const { width, height } = e.nativeEvent.layout;
-              setPreviewLayout((prev) =>
-                prev && prev.w === width && prev.h === height ? prev : { w: width, h: height },
-              );
-            }}
-          >
+        <View
+          style={styles.previewCard}
+          collapsable={false}
+          onLayout={(e) => {
+            const { width, height } = e.nativeEvent.layout;
+            setPreviewLayout((prev) =>
+              prev && prev.w === width && prev.h === height ? prev : { w: width, h: height },
+            );
+          }}
+        >
           {cameraPermission?.granted ? (
-            <CameraView
-              ref={camRef}
-              style={StyleSheet.absoluteFill}
-              facing={facing}
-              mode={mode}
-              zoom={zoom}
-              flash={
-                mode === 'picture' && facing === 'back' ? flashMode : 'off'
-              }
-              enableTorch={
-                mode === 'picture' &&
-                facing === 'back' &&
-                flashMode === 'on'
-              }
-              mirror={facing === 'front'}
-              onCameraReady={() => setCameraReady(true)}
-              onMountError={(ev) => Alert.alert('相机错误', ev.message)}
-            />
+            <GestureDetector gesture={pinchGesture}>
+              <AnimatedCameraView
+                ref={camRef}
+                style={StyleSheet.absoluteFill}
+                facing={facing}
+                mode={mode}
+                animatedProps={cameraAnimatedProps}
+                flash={
+                  mode === 'picture' && facing === 'back' ? flashMode : 'off'
+                }
+                enableTorch={
+                  mode === 'picture' &&
+                  facing === 'back' &&
+                  flashMode === 'on'
+                }
+                mirror={facing === 'front'}
+                onCameraReady={() => setCameraReady(true)}
+                onMountError={(ev) => Alert.alert('相机错误', ev.message)}
+              />
+            </GestureDetector>
           ) : (
             <View style={styles.previewPlaceholder}>
               <Text style={styles.placeholderText}>相机未授权</Text>
@@ -1072,24 +1190,20 @@ export function RetroCameraScreen() {
               {preset.label} · {filter.label}
             </Text>
           </View>
-          {wmPreviewRect && watermark.kind !== 'none' ? (
+          {displayWmRect && watermark.kind !== 'none' ? (
             <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
               <View
                 style={[
-                  styles.watermarkDragHitbox,
                   {
-                    left: wmPreviewRect.x,
-                    top: wmPreviewRect.y,
-                    width: wmPreviewRect.w,
-                    height: wmPreviewRect.h,
+                    position: 'absolute',
+                    left: displayWmRect.x,
+                    top: displayWmRect.y,
+                    width: displayWmRect.w,
+                    height: displayWmRect.h,
                   },
                 ]}
-                pointerEvents={
-                  watermark.kind === 'custom' && watermark.watermark.placement ? 'auto' : 'none'
-                }
-                {...(watermark.kind === 'custom' && watermark.watermark.placement
-                  ? wmPanResponder.panHandlers
-                  : {})}
+                pointerEvents="auto"
+                {...wmPanHandlers}
               >
                 <Image
                   source={
@@ -1097,14 +1211,7 @@ export function RetroCameraScreen() {
                       ? getWatermarkAssetSource(watermark.id)!
                       : { uri: watermark.watermark.uri }
                   }
-                  style={[
-                    styles.watermarkPreviewImage,
-                    {
-                      width: wmPreviewRect.w,
-                      height: wmPreviewRect.h,
-                      opacity: wmRenderCfg.opacity,
-                    },
-                  ]}
+                  style={[styles.watermarkPreviewImage, { opacity: wmRenderCfg.opacity }]}
                   resizeMode="stretch"
                   accessibilityElementsHidden
                   importantForAccessibility="no-hide-descendants"
@@ -1118,8 +1225,7 @@ export function RetroCameraScreen() {
               <Text style={styles.busyTxt}>正在启动相机…</Text>
             </View>
           ) : null}
-          </View>
-        </PinchGestureHandler>
+        </View>
       </View>
 
       <View style={styles.modeRow}>
@@ -1378,7 +1484,18 @@ const styles = StyleSheet.create({
     paddingTop: 2,
     paddingBottom: 8,
   },
-  retroBrandBlock: { flex: 1 },
+  retroBrandBlock: { flex: 1, alignSelf: 'stretch', justifyContent: 'center' },
+  wmDebugPanel: {
+    marginHorizontal: 10,
+    marginBottom: 6,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: 'rgba(0,0,0,0.82)',
+    borderWidth: 1,
+    borderColor: 'rgba(201,169,98,0.5)',
+  },
+  wmDebugTitle: { color: C.gold, fontWeight: '800', fontSize: 12, marginBottom: 6 },
+  wmDebugLine: { color: 'rgba(255,255,255,0.88)', fontSize: 10, fontFamily: 'monospace', marginBottom: 3 },
   retroBrandLine: {
     color: C.gold,
     fontSize: 11,
@@ -1656,9 +1773,6 @@ const styles = StyleSheet.create({
   watermarkPreviewImage: {
     width: '100%',
     height: '100%',
-  },
-  watermarkDragHitbox: {
-    position: 'absolute',
   },
   busyWrap: {
     ...StyleSheet.absoluteFillObject,
